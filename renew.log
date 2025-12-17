@@ -1,0 +1,12 @@
+[PM2] Spawning PM2 daemon with pm2_home=/root/.pm2
+[PM2] PM2 Successfully daemonized
+Use --update-env to update environment variables
+[PM2][ERROR] Process or Namespace odoo-proxy not found
+Use --update-env to update environment variables
+[PM2] Applying action restartProcessId on app [odoo-proxy](ids: [ 0 ])
+[PM2] [odoo-proxy](0) ✓
+┌────┬───────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name          │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼───────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 0  │ odoo-proxy    │ default     │ 1.0.0   │ fork    │ 2981     │ 0s     │ 19   │ online    │ 0%       │ 14.6mb   │ root     │ disabled │
+└────┴───────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
