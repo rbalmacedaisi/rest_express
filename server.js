@@ -18,6 +18,29 @@ app.use((req, res, next) => {
 app.use(cors());
 app.use(express.json());
 
+// --- CACHE IMPLEMENTATION ---
+const studentStatusCache = new Map();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Helper to get from cache
+function getCachedStatus(documentNumber) {
+  if (!studentStatusCache.has(documentNumber)) return null;
+  const { timestamp, data } = studentStatusCache.get(documentNumber);
+  if (Date.now() - timestamp > CACHE_TTL_MS) {
+    studentStatusCache.delete(documentNumber);
+    return null;
+  }
+  return data;
+}
+
+// Helper to set cache
+function setCachedStatus(documentNumber, data) {
+  studentStatusCache.set(documentNumber, {
+    timestamp: Date.now(),
+    data
+  });
+}
+
 app.get('/api/odoo/invoices', async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
@@ -39,7 +62,7 @@ app.get('/api/odoo/invoices', async (req, res) => {
       );
 
       if (!partners.length) {
-        console.log(`No se encontr▒ partner para documento: ${documentNumber}`);
+        console.log(`No se encontró partner para documento: ${documentNumber}`);
         return res.json([]);
       }
 
@@ -151,10 +174,120 @@ app.get('/api/odoo/partner-contract-type', async (req, res) => {
   }
 });
 
+// NUEVO ENDPOINT: Verificar Estado del Estudiante (Con Caché)
+app.get('/api/odoo/status', async (req, res) => {
+  try {
+    const documentNumber = req.query.documentNumber;
+
+    if (!documentNumber) {
+      return res.status(400).json({ error: 'Se requiere documentNumber' });
+    }
+
+    // 1. Verificar Caché
+    const cached = getCachedStatus(documentNumber);
+    if (cached) {
+      console.log(`[CACHE] Sirviendo estado desde caché para: ${documentNumber}`);
+      return res.json(cached);
+    }
+
+    console.log(`[STATUS] Consultando Odoo para: ${documentNumber}`);
+    const odoo = new OdooAPI();
+
+    // 2. Obtener Partner ID y Tipo de Contrato
+    const partners = await odoo.call('res.partner', 'search_read',
+      [[['vat', '=', documentNumber]]],
+      { fields: ['id', 'x_studio_tipo_contrato_especial'] }
+    );
+
+    if (!partners.length) {
+      const result = { allowed: false, reason: 'sin_contrato_o_usuario' };
+      setCachedStatus(documentNumber, result);
+      return res.json(result);
+    }
+
+    const partner = partners[0];
+    const contractType = partner.x_studio_tipo_contrato_especial;
+
+    // 3. Regla de Contrato Especial (Beca / IFARHU)
+    if (contractType === 'Beca' || contractType === 'IFARHU') {
+      const result = { allowed: true, reason: 'becado' };
+      console.log(`[STATUS] Acceso PERMITIDO (Beca/IFARHU) para: ${documentNumber}`);
+      setCachedStatus(documentNumber, result);
+      return res.json(result);
+    }
+
+    // 4. Buscar Facturas Vencidas
+    const invoices = await odoo.call(
+      'account.move',
+      'search_read',
+      [[['partner_id', '=', parseInt(partner.id)], ['move_type', '=', 'out_invoice']]],
+      {
+        fields: ['state', 'invoice_date_due', 'amount_residual'],
+        order: 'invoice_date_due desc'
+      }
+    );
+
+    // Si no hay facturas
+    if (!invoices || invoices.length === 0) {
+      const result = { allowed: false, reason: 'sincontrato' };
+      console.log(`[STATUS] Acceso DENEGADO (Sin facturas) para: ${documentNumber}`);
+      setCachedStatus(documentNumber, result);
+      return res.json(result);
+    }
+
+    // Filtrar MORA
+    const now = new Date();
+    const overdue = invoices.filter(inv =>
+      inv.state !== 'paid' &&
+      inv.invoice_date_due &&
+      new Date(inv.invoice_date_due) < now &&
+      inv.amount_residual > 0
+    );
+
+    // 5. Determinar Estado Final
+    let result;
+    if (overdue.length > 0) {
+      result = { allowed: false, reason: 'mora' };
+      console.log(`[STATUS] Acceso DENEGADO (Mora) para: ${documentNumber}`);
+    } else {
+      result = { allowed: true, reason: 'al_dia' };
+      console.log(`[STATUS] Acceso PERMITIDO (Al día) para: ${documentNumber}`);
+    }
+
+    // Guardar en caché y retornar
+    setCachedStatus(documentNumber, result);
+    res.json(result);
+
+  } catch (err) {
+    console.error('Error en /api/odoo/status:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// NUEVO ENDPOINT: Limpiar Caché
+app.post('/api/odoo/cache/clear', (req, res) => {
+  const documentNumber = req.body.documentNumber;
+
+  if (documentNumber) {
+    if (studentStatusCache.has(documentNumber)) {
+      studentStatusCache.delete(documentNumber);
+      console.log(`[CACHE] Limpiado manualmente para: ${documentNumber}`);
+      return res.json({ success: true, message: `Caché limpiado para ${documentNumber}` });
+    } else {
+      return res.json({ success: true, message: `No había caché para ${documentNumber}` });
+    }
+  } else {
+    // Limpiar todo (opcional, para admin)
+    studentStatusCache.clear();
+    console.log(`[CACHE] Todo el caché ha sido limpiado.`);
+    return res.json({ success: true, message: 'Todo el caché ha sido limpiado' });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 const HOST = '0.0.0.0';
 
-// Configuraci▒n de HTTPS
+// Configuración de HTTPS
 const httpsOptions = {
   key: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/privkey.pem'),
   cert: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/fullchain.pem')
@@ -163,7 +296,7 @@ const httpsOptions = {
 // Crear servidor HTTPS
 https.createServer(httpsOptions, app).listen(PORT, HOST, () => {
   console.log(`Odoo proxy API corriendo en https://${HOST}:${PORT}`);
-  console.log('IPs de la m▒quina:');
+  console.log('IPs de la máquina:');
   const { networkInterfaces } = require('os');
   const nets = networkInterfaces();
   for (const name of Object.keys(nets)) {
