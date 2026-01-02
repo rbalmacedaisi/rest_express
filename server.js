@@ -264,6 +264,128 @@ app.get('/api/odoo/status', async (req, res) => {
   }
 });
 
+// NUEVO ENDPOINT: Verificar Estado de Estudiantes en Bloque (Bulk)
+app.post('/api/odoo/status/bulk', async (req, res) => {
+  try {
+    const { documentNumbers } = req.body;
+
+    if (!documentNumbers || !Array.isArray(documentNumbers)) {
+      return res.status(400).json({ error: 'Se requiere un array de documentNumbers' });
+    }
+
+    const results = {};
+    const toFetch = [];
+
+    // 1. Verificar Caché
+    for (const doc of documentNumbers) {
+      const cached = getCachedStatus(doc);
+      if (cached) {
+        results[doc] = cached;
+      } else {
+        toFetch.push(doc);
+      }
+    }
+
+    if (toFetch.length === 0) {
+      console.log(`[BULK] Sirviendo todos los (${documentNumbers.length}) estados desde caché`);
+      return res.json(results);
+    }
+
+    console.log(`[BULK] Consultando Odoo para ${toFetch.length} documentos (de ${documentNumbers.length} totales)`);
+    const odoo = new OdooAPI();
+
+    // 2. Obtener Partners en bloque
+    const partners = await odoo.call('res.partner', 'search_read',
+      [[['vat', 'in', toFetch]]],
+      { fields: ['id', 'vat', 'x_studio_tipo_contrato_especial'] }
+    );
+
+    const partnerMap = {}; // vat -> partner
+    partners.forEach(p => {
+      partnerMap[p.vat] = p;
+    });
+
+    const docToPartnerId = {}; // doc -> partner_id
+    const partnerIdsNeedInvoices = [];
+    const now = new Date();
+
+    for (const doc of toFetch) {
+      const partner = partnerMap[doc];
+
+      if (!partner) {
+        results[doc] = { allowed: false, reason: 'sin_contrato_o_usuario' };
+        setCachedStatus(doc, results[doc]);
+        continue;
+      }
+
+      const contractType = partner.x_studio_tipo_contrato_especial;
+
+      if (contractType === 'Beca' || contractType === 'IFARHU') {
+        results[doc] = { allowed: true, reason: 'becado' };
+        setCachedStatus(doc, results[doc]);
+      } else {
+        docToPartnerId[doc] = partner.id;
+        partnerIdsNeedInvoices.push(partner.id);
+      }
+    }
+
+    // 3. Obtener Facturas en bloque para los que no son becados
+    if (partnerIdsNeedInvoices.length > 0) {
+      console.log(`[BULK] Buscando facturas para ${partnerIdsNeedInvoices.length} partners`);
+      const allInvoices = await odoo.call(
+        'account.move',
+        'search_read',
+        [[['partner_id', 'in', partnerIdsNeedInvoices], ['move_type', '=', 'out_invoice']]],
+        {
+          fields: ['partner_id', 'state', 'invoice_date_due', 'amount_residual'],
+          order: 'invoice_date_due desc'
+        }
+      );
+
+      // Agrupar facturas por partner
+      const invoicesByPartner = {};
+      allInvoices.forEach(inv => {
+        const pid = inv.partner_id[0];
+        if (!invoicesByPartner[pid]) invoicesByPartner[pid] = [];
+        invoicesByPartner[pid].push(inv);
+      });
+
+      // Procesar cada estudiante que necesitaba facturas
+      for (const doc of toFetch) {
+        if (results[doc]) continue; // Ya procesado (becado o no encontrado)
+
+        const partnerId = docToPartnerId[doc];
+        const studentInvoices = invoicesByPartner[partnerId] || [];
+
+        if (studentInvoices.length === 0) {
+          results[doc] = { allowed: false, reason: 'sincontrato' };
+        } else {
+          const overdue = studentInvoices.filter(inv =>
+            inv.state !== 'paid' &&
+            inv.invoice_date_due &&
+            new Date(inv.invoice_date_due) < now &&
+            inv.amount_residual > 0
+          );
+
+          if (overdue.length > 0) {
+            results[doc] = { allowed: false, reason: 'mora' };
+          } else {
+            results[doc] = { allowed: true, reason: 'al_dia' };
+          }
+        }
+        setCachedStatus(doc, results[doc]);
+      }
+    }
+
+    res.json(results);
+
+  } catch (err) {
+    console.error('Error en /api/odoo/status/bulk:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // NUEVO ENDPOINT: Limpiar Caché
 app.post('/api/odoo/cache/clear', (req, res) => {
   const documentNumber = req.body.documentNumber;
