@@ -208,8 +208,8 @@ app.get('/api/odoo/status', async (req, res) => {
     const partner = partners[0];
     const contractType = partner.x_studio_tipo_contrato_especial;
 
-    // 3. Regla de Contrato Especial (Beca / IFARHU)
-    if (contractType === 'Beca' || contractType === 'IFARHU') {
+    // 3. Regla de Contrato Especial (Beca / IFARHU / Carrera Completa)
+    if (contractType === 'Beca' || contractType === 'IFARHU' || contractType === 'Carrera Completa') {
       const result = { allowed: true, reason: 'becado' };
       console.log(`[STATUS] Acceso PERMITIDO (Beca/IFARHU) para: ${documentNumber}`);
       setCachedStatus(documentNumber, result);
@@ -320,7 +320,7 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
 
       const contractType = partner.x_studio_tipo_contrato_especial;
 
-      if (contractType === 'Beca' || contractType === 'IFARHU') {
+      if (contractType === 'Beca' || contractType === 'IFARHU' || contractType === 'Carrera Completa') {
         results[doc] = { allowed: true, reason: 'becado' };
         setCachedStatus(doc, results[doc]);
       } else {
