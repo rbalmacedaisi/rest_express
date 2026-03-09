@@ -3,6 +3,36 @@ const cors = require('cors');
 const OdooAPI = require('./odooApi');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
+
+// --- BYPASS FINANCIERO GLOBAL ---
+// Secret para proteger el endpoint admin (cámbialo en producción)
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'gmk_admin_bypass_2026';
+const BYPASS_CONFIG_FILE = path.join(__dirname, 'bypass_config.json');
+
+function loadBypassConfig() {
+  try {
+    if (fs.existsSync(BYPASS_CONFIG_FILE)) {
+      const raw = fs.readFileSync(BYPASS_CONFIG_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.error('[BYPASS] Error leyendo bypass_config.json:', e.message);
+  }
+  return { enabled: false, updatedAt: null, updatedBy: null };
+}
+
+function saveBypassConfig(config) {
+  try {
+    fs.writeFileSync(BYPASS_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[BYPASS] Error guardando bypass_config.json:', e.message);
+  }
+}
+
+// Cargar estado inicial desde disco
+let bypassConfig = loadBypassConfig();
+console.log(`[BYPASS] Estado inicial: ${bypassConfig.enabled ? 'ACTIVADO' : 'desactivado'}`);
 
 const app = express();
 
@@ -183,6 +213,12 @@ app.get('/api/odoo/status', async (req, res) => {
       return res.status(400).json({ error: 'Se requiere documentNumber' });
     }
 
+    // 0. Bypass Global: Ignorar Estado Financiero en Login
+    if (bypassConfig.enabled) {
+      console.log(`[BYPASS] Acceso PERMITIDO por bypass global para: ${documentNumber}`);
+      return res.json({ allowed: true, reason: 'bypass_financiero' });
+    }
+
     // 1. Verificar Caché
     const cached = getCachedStatus(documentNumber);
     if (cached) {
@@ -271,6 +307,14 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
 
     if (!documentNumbers || !Array.isArray(documentNumbers)) {
       return res.status(400).json({ error: 'Se requiere un array de documentNumbers' });
+    }
+
+    // Bypass global: todos permitidos
+    if (bypassConfig.enabled) {
+      console.log(`[BYPASS] Bulk: acceso PERMITIDO por bypass global para ${documentNumbers.length} estudiantes`);
+      const results = {};
+      documentNumbers.forEach(doc => { results[doc] = { allowed: true, reason: 'bypass_financiero' }; });
+      return res.json(results);
     }
 
     const results = {};
@@ -404,6 +448,58 @@ app.post('/api/odoo/cache/clear', (req, res) => {
     console.log(`[CACHE] Todo el caché ha sido limpiado.`);
     return res.json({ success: true, message: 'Todo el caché ha sido limpiado' });
   }
+});
+
+// --- ENDPOINTS ADMIN: BYPASS FINANCIERO ---
+
+// Middleware de autenticación para endpoints admin
+function adminAuth(req, res, next) {
+  const secret = req.headers['x-admin-secret'];
+  if (!secret || secret !== ADMIN_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  next();
+}
+
+// GET /api/admin/bypass - Consultar estado actual del bypass
+app.get('/api/admin/bypass', adminAuth, (req, res) => {
+  res.json({
+    enabled: bypassConfig.enabled,
+    updatedAt: bypassConfig.updatedAt,
+    updatedBy: bypassConfig.updatedBy
+  });
+});
+
+// POST /api/admin/bypass - Activar o desactivar el bypass
+app.post('/api/admin/bypass', adminAuth, (req, res) => {
+  const { enabled, updatedBy } = req.body;
+
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'El campo "enabled" debe ser un booleano' });
+  }
+
+  bypassConfig = {
+    enabled,
+    updatedAt: new Date().toISOString(),
+    updatedBy: updatedBy || 'admin'
+  };
+
+  saveBypassConfig(bypassConfig);
+
+  const estado = enabled ? 'ACTIVADO' : 'desactivado';
+  console.log(`[BYPASS] Bypass financiero ${estado} por: ${bypassConfig.updatedBy} (${bypassConfig.updatedAt})`);
+
+  // Si se activa el bypass, limpiar toda la caché para que no haya residuos
+  if (enabled) {
+    studentStatusCache.clear();
+    console.log('[BYPASS] Caché limpiada al activar bypass');
+  }
+
+  res.json({
+    success: true,
+    enabled: bypassConfig.enabled,
+    message: `Bypass financiero ${estado} correctamente`
+  });
 });
 
 const PORT = process.env.PORT || 4000;
