@@ -8,6 +8,52 @@ const path = require('path');
 // --- BYPASS FINANCIERO GLOBAL ---
 // Secret para proteger el endpoint admin (cámbialo en producción)
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'gmk_admin_bypass_2026';
+
+// --- PERIODO DE GRACIA (primer login) ---
+const MOODLE_URL         = process.env.MOODLE_URL         || 'https://lms.isi.edu.pa';
+const MOODLE_GRACE_TOKEN = process.env.MOODLE_GRACE_TOKEN || 'gmk_grace_check_2026';
+
+/**
+ * Consult Moodle to check if a student is in their first-login grace period.
+ * Returns true if inGrace, false otherwise (including on error — fail open).
+ */
+async function checkGracePeriod(documentNumber) {
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({
+      action: 'local_grupomakro_check_grace_period',
+      documentnumber: documentNumber,
+      token: MOODLE_GRACE_TOKEN,
+    });
+    const url = `${MOODLE_URL}/local/grupomakro_core/ajax.php?${params}`;
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      rejectUnauthorized: false,
+    };
+    const lib = parsedUrl.protocol === 'https:' ? https : require('http');
+    const req = lib.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve(json.inGrace === true ? json : false);
+        } catch (e) {
+          resolve(false);
+        }
+      });
+    });
+    req.on('error', (e) => {
+      console.warn(`[GRACE] Error consultando periodo de gracia: ${e.message}`);
+      resolve(false);
+    });
+    req.setTimeout(5000, () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
 const BYPASS_CONFIG_FILE = path.join(__dirname, 'bypass_config.json');
 
 function loadBypassConfig() {
@@ -217,6 +263,18 @@ app.get('/api/odoo/status', async (req, res) => {
     if (bypassConfig.enabled) {
       console.log(`[BYPASS] Acceso PERMITIDO por bypass global para: ${documentNumber}`);
       return res.json({ allowed: true, reason: 'bypass_financiero' });
+    }
+
+    // 0.1 Periodo de Gracia: primer mes del estudiante
+    try {
+      const graceResult = await checkGracePeriod(documentNumber);
+      if (graceResult) {
+        console.log(`[GRACE] Acceso PERMITIDO por periodo de gracia para: ${documentNumber}`);
+        return res.json({ allowed: true, reason: 'periodo_gracia', graceuntil: graceResult.graceuntil });
+      }
+    } catch (graceErr) {
+      // Si falla, continúa con validación Odoo normal
+      console.warn(`[GRACE] Error en checkGracePeriod: ${graceErr.message}`);
     }
 
     // 1. Verificar Caché
