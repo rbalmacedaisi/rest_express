@@ -508,6 +508,48 @@ app.post('/api/odoo/cache/clear', (req, res) => {
   }
 });
 
+// POST /api/odoo/profile/update — actualiza teléfono y/o fecha de nacimiento en Odoo
+app.post('/api/odoo/profile/update', async (req, res) => {
+  const { documentNumber, phone, birthdate } = req.body;
+
+  if (!documentNumber) {
+    return res.status(400).json({ success: false, error: 'documentNumber requerido' });
+  }
+  if (phone === undefined && birthdate === undefined) {
+    return res.status(400).json({ success: false, error: 'Se requiere al menos un campo (phone o birthdate)' });
+  }
+
+  try {
+    const odoo = new OdooAPI();
+    await odoo.authenticate();
+
+    // Buscar partner por número de documento (campo vat)
+    const partners = await odoo.call(
+      'res.partner', 'search_read',
+      [[['vat', '=', documentNumber]]],
+      { fields: ['id', 'name'], limit: 1 }
+    );
+
+    if (!partners || partners.length === 0) {
+      return res.status(404).json({ success: false, error: `Partner no encontrado para documento: ${documentNumber}` });
+    }
+
+    const partnerId = partners[0].id;
+    const updateData = {};
+    if (phone !== undefined)     updateData.phone     = phone;
+    if (birthdate !== undefined) updateData.birthdate = birthdate; // YYYY-MM-DD
+
+    await odoo.call('res.partner', 'write', [[partnerId], updateData]);
+
+    console.log(`[Profile Update] Partner ${partnerId} (${partners[0].name}) actualizado:`, updateData);
+    res.json({ success: true, partnerId });
+
+  } catch (error) {
+    console.error('[Profile Update] Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // --- ENDPOINTS ADMIN: BYPASS FINANCIERO ---
 
 // Middleware de autenticación para endpoints admin
