@@ -535,13 +535,29 @@ app.post('/api/odoo/profile/update', async (req, res) => {
     }
 
     const partnerId = partners[0].id;
-    const updateData = {};
-    if (phone !== undefined)     updateData.phone     = phone;
-    if (birthdate !== undefined) updateData.birthdate = birthdate; // YYYY-MM-DD
 
-    await odoo.call('res.partner', 'write', [[partnerId], updateData]);
+    // 1. Actualizar res.partner
+    const partnerData = {};
+    if (phone !== undefined)     partnerData.phone     = phone;
+    if (birthdate !== undefined) partnerData.birthdate = birthdate; // YYYY-MM-DD
+    await odoo.call('res.partner', 'write', [[partnerId], partnerData]);
 
-    console.log(`[Profile Update] Partner ${partnerId} (${partners[0].name}) actualizado:`, updateData);
+    // 2. Si viene birthdate, también actualizar moodle.user.birthDate
+    //    (el sync de Odoo→Moodle usa self.birthDate del registro moodle.user,
+    //     no del partner, por lo que hay que actualizarlo explícitamente)
+    if (birthdate !== undefined) {
+      const moodleUsers = await odoo.call(
+        'moodle.user', 'search_read',
+        [[['partner_id', '=', partnerId]]],
+        { fields: ['id'], limit: 1 }
+      );
+      if (moodleUsers && moodleUsers.length > 0) {
+        await odoo.call('moodle.user', 'write', [[moodleUsers[0].id], { birthDate: birthdate }]);
+        console.log(`[Profile Update] moodle.user ${moodleUsers[0].id} birthDate actualizado`);
+      }
+    }
+
+    console.log(`[Profile Update] Partner ${partnerId} (${partners[0].name}) actualizado:`, partnerData);
     res.json({ success: true, partnerId });
 
   } catch (error) {
