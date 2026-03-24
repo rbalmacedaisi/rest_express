@@ -4,6 +4,7 @@ const OdooAPI = require('./odooApi');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // --- BYPASS FINANCIERO GLOBAL ---
 // Secret para proteger el endpoint admin (cámbialo en producción)
@@ -12,6 +13,10 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'gmk_admin_bypass_2026';
 // --- PERIODO DE GRACIA (primer login) ---
 const MOODLE_URL         = process.env.MOODLE_URL         || 'https://lms.isi.edu.pa';
 const MOODLE_GRACE_TOKEN = process.env.MOODLE_GRACE_TOKEN || 'gmk_grace_check_2026';
+const MOODLE_LETTERS_WEBHOOK_URL = process.env.MOODLE_LETTERS_WEBHOOK_URL || `${MOODLE_URL}/local/grupomakro_core/letters_webhook.php`;
+const MOODLE_LETTERS_WEBHOOK_TOKEN = process.env.MOODLE_LETTERS_WEBHOOK_TOKEN || 'gmk_letter_webhook_2026';
+const ODOO_LETTERS_WEBHOOK_SECRET = process.env.ODOO_LETTERS_WEBHOOK_SECRET || 'gmk_letters_hmac_2026';
+const ODOO_BASE_URL = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
 
 /**
  * Consult Moodle to check if a student is in their first-login grace period.
@@ -116,6 +121,421 @@ function setCachedStatus(documentNumber, data) {
     data
   });
 }
+
+// --- LETTER REQUESTS (Moodle <-> Express <-> Odoo) ---
+const letterInvoiceCache = new Map();
+const letterAttachmentCache = new Map();
+const processedLetterWebhookEvents = new Map();
+const LETTER_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function cleanupProcessedLetterEvents() {
+  const now = Date.now();
+  for (const [key, timestamp] of processedLetterWebhookEvents.entries()) {
+    if (now - timestamp > LETTER_EVENT_TTL_MS) {
+      processedLetterWebhookEvents.delete(key);
+    }
+  }
+}
+
+function normalizePaymentLink(accessUrl) {
+  if (!accessUrl) return '';
+  try {
+    if (typeof accessUrl === 'string' && accessUrl.startsWith('/')) {
+      return new URL(accessUrl, ODOO_BASE_URL).toString();
+    }
+    const parsed = new URL(accessUrl);
+    const configured = new URL(ODOO_BASE_URL);
+    if (parsed.hostname === configured.hostname) {
+      parsed.port = '';
+      return parsed.toString();
+    }
+    return accessUrl;
+  } catch (error) {
+    return accessUrl;
+  }
+}
+
+function buildLetterRef(externalRequestId) {
+  return `LETTER_REQ:${String(externalRequestId).trim()}`;
+}
+
+function canonicalWebhookPayload(payload) {
+  const source = payload || {};
+  const normalized = {
+    invoice_id: String(source.invoice_id || ''),
+    invoice_number: String(source.invoice_number || ''),
+    payment_state: String(source.payment_state || ''),
+    partner_vat: String(source.partner_vat || ''),
+    external_request_id: String(source.external_request_id || ''),
+    event_time: String(source.event_time || ''),
+  };
+  return JSON.stringify(normalized);
+}
+
+function signWebhookPayload(payload) {
+  const canonical = canonicalWebhookPayload(payload);
+  return crypto
+    .createHmac('sha256', ODOO_LETTERS_WEBHOOK_SECRET)
+    .update(canonical)
+    .digest('hex');
+}
+
+function verifyWebhookSignature(payload, signature) {
+  if (!signature) return false;
+  const expected = signWebhookPayload(payload);
+  const received = String(signature).replace(/^sha256=/i, '').trim().toLowerCase();
+  if (received.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(received, 'hex'), Buffer.from(expected, 'hex'));
+  } catch (error) {
+    return false;
+  }
+}
+
+function postJson(url, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const jsonPayload = JSON.stringify(payload);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'POST',
+      rejectUnauthorized: false,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(jsonPayload),
+        ...headers,
+      },
+    };
+
+    const transport = parsedUrl.protocol === 'https:' ? https : require('http');
+    const req = transport.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = body ? JSON.parse(body) : null;
+        } catch (error) {
+          parsed = null;
+        }
+        resolve({
+          statusCode: res.statusCode || 0,
+          body,
+          json: parsed,
+        });
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('request_timeout'));
+    });
+    req.write(jsonPayload);
+    req.end();
+  });
+}
+
+async function findPartnerByDocument(odoo, documentNumber) {
+  const partners = await odoo.call('res.partner', 'search_read', [[['vat', '=', String(documentNumber).trim()]]], {
+    fields: ['id', 'name', 'email', 'vat'],
+    limit: 1,
+  });
+  return partners && partners.length ? partners[0] : null;
+}
+
+async function findLetterInvoiceByRef(odoo, externalRequestId) {
+  const ref = buildLetterRef(externalRequestId);
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['ref', '=', ref],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    order: 'id desc',
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+async function readLetterInvoiceById(odoo, invoiceId) {
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['id', '=', Number(invoiceId)],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+app.post('/api/odoo/letters/invoice', async (req, res) => {
+  try {
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+    const documentNumber = String(req.body?.document_number || '').trim();
+    const amount = Number(req.body?.amount);
+    const requestedProductId = Number(req.body?.odoo_product_id || 0);
+
+    if (!externalRequestId || !documentNumber || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'external_request_id, document_number and amount > 0 are required',
+      });
+    }
+
+    if (letterInvoiceCache.has(externalRequestId)) {
+      return res.json({
+        ...letterInvoiceCache.get(externalRequestId),
+        idempotent: true,
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let invoice = await findLetterInvoiceByRef(odoo, externalRequestId);
+
+    if (!invoice) {
+      const partner = await findPartnerByDocument(odoo, documentNumber);
+      if (!partner) {
+        return res.status(404).json({
+          success: false,
+          error: `partner_not_found_for_document:${documentNumber}`,
+        });
+      }
+
+      const fallbackProductId = Number(process.env.ODOO_LETTERS_DEFAULT_PRODUCT_ID || 0);
+      const productId = requestedProductId > 0 ? requestedProductId : fallbackProductId;
+      if (productId <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "odoo_product_id_required",
+        });
+      }
+
+      const lineValues = {
+        name: String(req.body?.description || `Solicitud de carta (#${externalRequestId})`),
+        quantity: 1,
+        price_unit: amount,
+        product_id: productId,
+      };
+
+      const invoiceValues = {
+        move_type: 'out_invoice',
+        partner_id: partner.id,
+        ref: buildLetterRef(externalRequestId),
+        invoice_origin: String(req.body?.letter_type_code || ''),
+        invoice_date: new Date().toISOString().slice(0, 10),
+        invoice_line_ids: [[0, 0, lineValues]],
+      };
+
+      const invoiceId = await odoo.call('account.move', 'create', [invoiceValues]);
+      await odoo.call('account.move', 'action_post', [[invoiceId]]);
+      invoice = await readLetterInvoiceById(odoo, invoiceId);
+    }
+
+    if (!invoice) {
+      return res.status(500).json({
+        success: false,
+        error: 'invoice_not_created',
+      });
+    }
+
+    const responsePayload = {
+      success: true,
+      invoice_id: String(invoice.id),
+      invoice_number: String(invoice.name || ''),
+      payment_link: normalizePaymentLink(invoice.access_url || ''),
+      external_request_id: externalRequestId,
+    };
+    letterInvoiceCache.set(externalRequestId, responsePayload);
+    res.json(responsePayload);
+  } catch (error) {
+    console.error('[letters/invoice] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post('/api/odoo/letters/attach-document', async (req, res) => {
+  try {
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+    const documentNumber = String(req.body?.document_number || '').trim();
+    const filename = String(req.body?.filename || '').trim();
+    const mimetype = String(req.body?.mimetype || 'application/pdf').trim();
+    const invoiceId = String(req.body?.invoice_id || '').trim();
+    const rawBase64 = String(req.body?.content_base64 || '').trim();
+    const contentBase64 = rawBase64.replace(/^data:.*;base64,/i, '');
+
+    if (!externalRequestId || !filename || !contentBase64) {
+      return res.status(400).json({
+        success: false,
+        error: 'external_request_id, filename and content_base64 are required',
+      });
+    }
+
+    const cacheKey = `${externalRequestId}:${invoiceId}:${filename}`;
+    if (letterAttachmentCache.has(cacheKey)) {
+      return res.json({
+        ...letterAttachmentCache.get(cacheKey),
+        idempotent: true,
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let targetModel = '';
+    let targetId = 0;
+
+    let invoice = null;
+    if (invoiceId) {
+      invoice = await readLetterInvoiceById(odoo, invoiceId);
+    }
+    if (!invoice && externalRequestId) {
+      invoice = await findLetterInvoiceByRef(odoo, externalRequestId);
+    }
+
+    if (invoice) {
+      targetModel = 'account.move';
+      targetId = Number(invoice.id);
+    } else {
+      if (!documentNumber) {
+        return res.status(400).json({
+          success: false,
+          error: 'document_number is required when invoice is not available',
+        });
+      }
+      const partner = await findPartnerByDocument(odoo, documentNumber);
+      if (!partner) {
+        return res.status(404).json({
+          success: false,
+          error: `partner_not_found_for_document:${documentNumber}`,
+        });
+      }
+      targetModel = 'res.partner';
+      targetId = Number(partner.id);
+    }
+
+    const description = buildLetterRef(externalRequestId);
+    const existing = await odoo.call('ir.attachment', 'search_read', [[
+      ['res_model', '=', targetModel],
+      ['res_id', '=', targetId],
+      ['name', '=', filename],
+      ['description', '=', description],
+    ]], {
+      fields: ['id', 'name'],
+      limit: 1,
+    });
+
+    let attachmentId = 0;
+    if (existing && existing.length) {
+      attachmentId = Number(existing[0].id);
+    } else {
+      attachmentId = Number(await odoo.call('ir.attachment', 'create', [{
+        name: filename,
+        datas: contentBase64,
+        mimetype,
+        type: 'binary',
+        res_model: targetModel,
+        res_id: targetId,
+        description,
+      }]));
+    }
+
+    const responsePayload = {
+      success: true,
+      attachment_id: String(attachmentId),
+      res_model: targetModel,
+      res_id: targetId,
+      external_request_id: externalRequestId,
+    };
+    letterAttachmentCache.set(cacheKey, responsePayload);
+    res.json(responsePayload);
+  } catch (error) {
+    console.error('[letters/attach-document] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post('/api/odoo/letters/webhook/payment', async (req, res) => {
+  try {
+    cleanupProcessedLetterEvents();
+
+    const payload = req.body || {};
+    const signature = req.headers['x-odoo-signature'] || payload.signature || '';
+    if (!verifyWebhookSignature(payload, signature)) {
+      return res.status(401).json({
+        success: false,
+        error: 'invalid_signature',
+      });
+    }
+
+    if (String(payload.payment_state || '') !== 'paid') {
+      return res.json({
+        success: true,
+        ignored: true,
+        reason: 'payment_state_not_paid',
+      });
+    }
+
+    const eventKey = [
+      String(payload.invoice_id || ''),
+      String(payload.payment_state || ''),
+      String(payload.event_time || ''),
+      String(payload.external_request_id || ''),
+    ].join('|');
+
+    if (processedLetterWebhookEvents.has(eventKey)) {
+      return res.json({
+        success: true,
+        idempotent: true,
+        event_key: eventKey,
+      });
+    }
+
+    const moodlePayload = {
+      invoice_id: String(payload.invoice_id || ''),
+      invoice_number: String(payload.invoice_number || ''),
+      payment_state: String(payload.payment_state || ''),
+      partner_vat: String(payload.partner_vat || ''),
+      external_request_id: String(payload.external_request_id || ''),
+      event_time: String(payload.event_time || ''),
+    };
+
+    const moodleResponse = await postJson(
+      MOODLE_LETTERS_WEBHOOK_URL,
+      moodlePayload,
+      { 'X-Webhook-Token': MOODLE_LETTERS_WEBHOOK_TOKEN }
+    );
+
+    if (moodleResponse.statusCode < 200 || moodleResponse.statusCode >= 300 || moodleResponse.json?.success === false) {
+      console.error('[letters/webhook/payment] Moodle webhook failed:', moodleResponse);
+      return res.status(502).json({
+        success: false,
+        error: 'moodle_webhook_failed',
+        moodle_status: moodleResponse.statusCode,
+        moodle_response: moodleResponse.json || moodleResponse.body,
+      });
+    }
+
+    processedLetterWebhookEvents.set(eventKey, Date.now());
+    res.json({
+      success: true,
+      forwarded: true,
+      moodle: moodleResponse.json || {},
+    });
+  } catch (error) {
+    console.error('[letters/webhook/payment] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
 
 app.get('/api/odoo/invoices', async (req, res) => {
   try {
