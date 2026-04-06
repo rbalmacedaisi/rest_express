@@ -311,7 +311,11 @@ class Q10Client {
   _parseCreditDetail(html) {
     const textDec = htmlUnescape(html);
 
-    // Determine status from Bootstrap label classes
+    // Determine status from Bootstrap label classes.
+    // label-success → al_dia / paz_y_salvo (allowed)
+    // label-danger  → mora (blocked)
+    // label-warning → pendiente (payment being processed, treat as al_dia)
+    // no label found → unknown (fall back to overdue cuotas check)
     let labelStatus = 'unknown';
     let m = textDec.match(/class="label label-success"[^>]*>([^<]+)<\/label>/);
     if (m) {
@@ -322,12 +326,16 @@ class Q10Client {
         labelStatus = 'mora';
       } else {
         m = textDec.match(/class="label label-warning"[^>]*>([^<]+)<\/label>/);
-        if (m) labelStatus = 'pendiente'; // Treat as mora (conservative)
+        if (m) labelStatus = 'pendiente'; // Payment processing — not mora
       }
     }
 
-    // Extract pending cuotas from the "Cuotas programadas" table
-    const cuotasPendientes = [];
+    // Extract OVERDUE cuotas only (fecha < today AND balance > 0 AND not paid).
+    // Future cuotas are not a sign of mora — every active student has them.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const cuotasVencidas = [];
     const sectionMatch = html.match(/Cuotas programadas([\s\S]+?)(?=Pagos realizados|Abono|Registrar|Agregar)/);
     if (sectionMatch) {
       const rows = [...sectionMatch[1].matchAll(/<tr[^>]*>([\s\S]+?)<\/tr>/g)];
@@ -338,16 +346,23 @@ class Q10Client {
         if (pendienteText.toUpperCase().includes('PAGADO')) continue;
         const pendiente = parseBalboa(cells[7]);
         if (pendiente <= 0) continue;
-        cuotasPendientes.push({
+        // Only include if due date is in the past
+        const fechaStr = cleanHtml(cells[1]);
+        const isoDate  = convertDate(fechaStr);
+        if (isoDate) {
+          const dueDate = new Date(isoDate);
+          if (dueDate >= today) continue; // Future cuota — skip
+        }
+        cuotasVencidas.push({
           nro:      cleanHtml(cells[0]),
-          fecha:    cleanHtml(cells[1]),
+          fecha:    fechaStr,
           total:    parseBalboa(cells[5]),
           pendiente,
         });
       }
     }
 
-    return { labelStatus, cuotasPendientes };
+    return { labelStatus, cuotasVencidas };
   }
 
   // -------------------------------------------------------------------------
@@ -369,8 +384,9 @@ class Q10Client {
       return { allowed: false, reason: 'sin_contrato_o_usuario', cuotasPendientes: [] };
     }
 
-    let hasMoraLabel = false;
-    const allCuotasPendientes = [];
+    let hasMoraLabel    = false;
+    let hasKnownLabel   = false;
+    const allCuotasVencidas = [];
 
     for (const cid of creditIds) {
       const res = await this._get(`/Estudiante/${student.id}/Credito/${cid}/Detalle`);
@@ -378,17 +394,21 @@ class Q10Client {
         console.warn(`[Q10] Could not fetch credit ${cid} for student ${documentNumber}: HTTP ${res.statusCode}`);
         continue;
       }
-      const { labelStatus, cuotasPendientes } = this._parseCreditDetail(res.text);
-      if (labelStatus === 'mora' || labelStatus === 'pendiente') {
-        hasMoraLabel = true;
-      }
-      allCuotasPendientes.push(...cuotasPendientes);
+      const { labelStatus, cuotasVencidas } = this._parseCreditDetail(res.text);
+
+      if (labelStatus !== 'unknown') hasKnownLabel = true;
+      if (labelStatus === 'mora')    hasMoraLabel  = true;
+
+      allCuotasVencidas.push(...cuotasVencidas);
     }
 
-    // Student is in mora if: explicit danger label OR has cuotas with positive balance
-    if (hasMoraLabel || allCuotasPendientes.length > 0) {
-      console.log(`[Q10] MORA for ${documentNumber}: label=${hasMoraLabel}, cuotas=${allCuotasPendientes.length}`);
-      return { allowed: false, reason: 'mora', cuotasPendientes: allCuotasPendientes };
+    // Primary signal: Q10 label (label-danger = mora, anything else = al_dia)
+    // Fallback (label unknown): mora only if there are actually overdue cuotas
+    const isMora = hasMoraLabel || (!hasKnownLabel && allCuotasVencidas.length > 0);
+
+    if (isMora) {
+      console.log(`[Q10] MORA for ${documentNumber}: label=${hasMoraLabel}, overdueCount=${allCuotasVencidas.length}`);
+      return { allowed: false, reason: 'mora', cuotasPendientes: allCuotasVencidas };
     }
 
     console.log(`[Q10] AL DÍA for ${documentNumber}`);
