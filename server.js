@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const OdooAPI = require('./odooApi');
+const q10Api  = require('./q10Api');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -84,6 +85,32 @@ function saveBypassConfig(config) {
 // Cargar estado inicial desde disco
 let bypassConfig = loadBypassConfig();
 console.log(`[BYPASS] Estado inicial: ${bypassConfig.enabled ? 'ACTIVADO' : 'desactivado'}`);
+
+// --- FUENTE DE DATOS FINANCIEROS (Q10 / Odoo) ---
+const FINANCIAL_SOURCE_CONFIG_FILE = path.join(__dirname, 'financial_source_config.json');
+
+function loadFinancialSourceConfig() {
+  try {
+    if (fs.existsSync(FINANCIAL_SOURCE_CONFIG_FILE)) {
+      const raw = fs.readFileSync(FINANCIAL_SOURCE_CONFIG_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.error('[FINANCIAL_SOURCE] Error leyendo config:', e.message);
+  }
+  return { source: 'odoo', updatedAt: null, updatedBy: null };
+}
+
+function saveFinancialSourceConfig(config) {
+  try {
+    fs.writeFileSync(FINANCIAL_SOURCE_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[FINANCIAL_SOURCE] Error guardando config:', e.message);
+  }
+}
+
+let financialSourceConfig = loadFinancialSourceConfig();
+console.log(`[FINANCIAL_SOURCE] Fuente inicial: ${financialSourceConfig.source}`);
 
 const app = express();
 
@@ -546,6 +573,19 @@ app.get('/api/odoo/invoices', async (req, res) => {
       return res.status(400).json({ error: 'Se requiere documentNumber o partnerId' });
     }
 
+    // Fuente Q10 (migración temporal) — solo aplica cuando tenemos documentNumber
+    if (financialSourceConfig.source === 'q10' && documentNumber) {
+      try {
+        console.log(`[Q10] Obteniendo cuotas (invoices) para: ${documentNumber}`);
+        const q10Result = await q10Api.getStudentStatus(documentNumber);
+        const invoices = q10Api.cuotasToInvoices(q10Result.cuotasPendientes || []);
+        return res.json(invoices);
+      } catch (q10Err) {
+        console.error(`[Q10] Error obteniendo cuotas para ${documentNumber}:`, q10Err.message);
+        return res.status(500).json({ error: 'Q10 query failed: ' + q10Err.message });
+      }
+    }
+
     const odoo = new OdooAPI();
     let finalPartnerId = partnerId;
 
@@ -704,6 +744,20 @@ app.get('/api/odoo/status', async (req, res) => {
       return res.json(cached);
     }
 
+    // 2. Fuente Q10 (migración temporal)
+    if (financialSourceConfig.source === 'q10') {
+      try {
+        console.log(`[Q10] Consultando estado financiero para: ${documentNumber}`);
+        const q10Result = await q10Api.getStudentStatus(documentNumber);
+        const result = { allowed: q10Result.allowed, reason: q10Result.reason };
+        setCachedStatus(documentNumber, result);
+        return res.json(result);
+      } catch (q10Err) {
+        console.error(`[Q10] Error consultando ${documentNumber}:`, q10Err.message);
+        return res.status(500).json({ error: 'Q10 query failed: ' + q10Err.message });
+      }
+    }
+
     console.log(`[STATUS] Consultando Odoo para: ${documentNumber}`);
     const odoo = new OdooAPI();
 
@@ -811,6 +865,23 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
     if (toFetch.length === 0) {
       console.log(`[BULK] Sirviendo todos los (${documentNumbers.length}) estados desde caché`);
       return res.json(results);
+    }
+
+    // Fuente Q10 (migración temporal)
+    if (financialSourceConfig.source === 'q10') {
+      try {
+        console.log(`[Q10] Bulk: consultando ${toFetch.length} estudiantes en Q10`);
+        const q10Results = await q10Api.getStudentStatusBulk(toFetch);
+        for (const [doc, q10Result] of Object.entries(q10Results)) {
+          const result = { allowed: q10Result.allowed, reason: q10Result.reason };
+          results[doc] = result;
+          setCachedStatus(doc, result);
+        }
+        return res.json(results);
+      } catch (q10Err) {
+        console.error('[Q10] Bulk error:', q10Err.message);
+        return res.status(500).json({ error: 'Q10 bulk query failed: ' + q10Err.message });
+      }
     }
 
     console.log(`[BULK] Consultando Odoo para ${toFetch.length} documentos (de ${documentNumbers.length} totales)`);
@@ -1035,6 +1106,50 @@ app.post('/api/admin/bypass', adminAuth, (req, res) => {
     success: true,
     enabled: bypassConfig.enabled,
     message: `Bypass financiero ${estado} correctamente`
+  });
+});
+
+// --- ENDPOINTS ADMIN: FUENTE DE DATOS FINANCIEROS ---
+
+// GET /api/admin/financial-source - Consultar fuente activa (odoo | q10)
+app.get('/api/admin/financial-source', adminAuth, (req, res) => {
+  res.json({
+    source:    financialSourceConfig.source,
+    updatedAt: financialSourceConfig.updatedAt,
+    updatedBy: financialSourceConfig.updatedBy,
+  });
+});
+
+// POST /api/admin/financial-source - Cambiar fuente
+app.post('/api/admin/financial-source', adminAuth, (req, res) => {
+  const { source, updatedBy } = req.body;
+
+  if (source !== 'odoo' && source !== 'q10') {
+    return res.status(400).json({ error: 'El campo "source" debe ser "odoo" o "q10"' });
+  }
+
+  const prev = financialSourceConfig.source;
+  financialSourceConfig = {
+    source,
+    updatedAt: new Date().toISOString(),
+    updatedBy: updatedBy || 'admin',
+  };
+
+  saveFinancialSourceConfig(financialSourceConfig);
+
+  // Clear cache when switching source to avoid stale results
+  studentStatusCache.clear();
+  console.log(`[FINANCIAL_SOURCE] Fuente cambiada de "${prev}" a "${source}" por: ${financialSourceConfig.updatedBy}`);
+
+  // Pre-initialize Q10 session in background when switching to Q10
+  if (source === 'q10') {
+    q10Api.login().catch(err => console.error('[Q10] Pre-login failed after source switch:', err.message));
+  }
+
+  res.json({
+    success:   true,
+    source:    financialSourceConfig.source,
+    message:   `Fuente de datos financieros cambiada a "${source}" correctamente`,
   });
 });
 
