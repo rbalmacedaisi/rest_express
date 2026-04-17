@@ -746,6 +746,24 @@ app.get('/api/odoo/status', async (req, res) => {
 
     // 2. Fuente Q10 (migración temporal)
     if (financialSourceConfig.source === 'q10') {
+      // Pre-check: contrato especial en Odoo, independiente de la fuente financiera
+      try {
+        const odooC = new OdooAPI();
+        const cPartners = await odooC.call('res.partner', 'search_read',
+          [[['vat', '=', documentNumber]]],
+          { fields: ['x_studio_tipo_contrato_especial'], limit: 1 }
+        );
+        if (cPartners.length > 0 && cPartners[0].x_studio_tipo_contrato_especial) {
+          const result = { allowed: true, reason: 'contrato_especial' };
+          console.log(`[STATUS] Acceso PERMITIDO (Contrato Especial: ${cPartners[0].x_studio_tipo_contrato_especial} / Q10-path) para: ${documentNumber}`);
+          setCachedStatus(documentNumber, result);
+          return res.json(result);
+        }
+      } catch (odooContractErr) {
+        console.warn(`[STATUS] No se pudo verificar contrato especial en Odoo para ${documentNumber}:`, odooContractErr.message);
+        // Fallo silencioso: continúa hacia Q10
+      }
+
       try {
         console.log(`[Q10] Consultando estado financiero para: ${documentNumber}`);
         const q10Result = await q10Api.getStudentStatus(documentNumber);
@@ -776,10 +794,10 @@ app.get('/api/odoo/status', async (req, res) => {
     const partner = partners[0];
     const contractType = partner.x_studio_tipo_contrato_especial;
 
-    // 3. Regla de Contrato Especial (Beca / IFARHU / Carrera Completa)
-    if (contractType === 'Beca' || contractType === 'IFARHU' || contractType === 'Carrera Completa') {
-      const result = { allowed: true, reason: 'becado' };
-      console.log(`[STATUS] Acceso PERMITIDO (Beca/IFARHU) para: ${documentNumber}`);
+    // 3. Regla de Contrato Especial (cualquier valor configurado)
+    if (contractType) {
+      const result = { allowed: true, reason: 'contrato_especial' };
+      console.log(`[STATUS] Acceso PERMITIDO (Contrato Especial: ${contractType}) para: ${documentNumber}`);
       setCachedStatus(documentNumber, result);
       return res.json(result);
     }
@@ -869,9 +887,36 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
 
     // Fuente Q10 (migración temporal)
     if (financialSourceConfig.source === 'q10') {
+      // Pre-check: contrato especial en Odoo para todos los pendientes
+      let stillToFetch = [...toFetch];
       try {
-        console.log(`[Q10] Bulk: consultando ${toFetch.length} estudiantes en Q10`);
-        const q10Results = await q10Api.getStudentStatusBulk(toFetch);
+        const odooC = new OdooAPI();
+        const cPartners = await odooC.call('res.partner', 'search_read',
+          [[['vat', 'in', toFetch]]],
+          { fields: ['vat', 'x_studio_tipo_contrato_especial'] }
+        );
+        const foundVats = new Set();
+        for (const cp of cPartners) {
+          foundVats.add(cp.vat);
+          if (cp.x_studio_tipo_contrato_especial) {
+            const r = { allowed: true, reason: 'contrato_especial' };
+            results[cp.vat] = r;
+            setCachedStatus(cp.vat, r);
+          }
+        }
+        stillToFetch = toFetch.filter(doc => !results[doc]);
+      } catch (odooContractErr) {
+        console.warn('[BULK] No se pudo verificar contratos especiales en Odoo:', odooContractErr.message);
+        // Fallo silencioso: continúa con Q10 para todos
+      }
+
+      if (stillToFetch.length === 0) {
+        return res.json(results);
+      }
+
+      try {
+        console.log(`[Q10] Bulk: consultando ${stillToFetch.length} estudiantes en Q10`);
+        const q10Results = await q10Api.getStudentStatusBulk(stillToFetch);
         for (const [doc, q10Result] of Object.entries(q10Results)) {
           const result = { allowed: q10Result.allowed, reason: q10Result.reason };
           results[doc] = result;
@@ -913,8 +958,8 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
 
       const contractType = partner.x_studio_tipo_contrato_especial;
 
-      if (contractType === 'Beca' || contractType === 'IFARHU' || contractType === 'Carrera Completa') {
-        results[doc] = { allowed: true, reason: 'becado' };
+      if (contractType) {
+        results[doc] = { allowed: true, reason: 'contrato_especial' };
         setCachedStatus(doc, results[doc]);
       } else {
         docToPartnerId[doc] = partner.id;
