@@ -1198,6 +1198,60 @@ app.post('/api/admin/financial-source', adminAuth, (req, res) => {
   });
 });
 
+// --- STUDENT CAREER FUNNEL (for student_timeline page in Moodle) ---
+// GET /api/odoo/students/career-funnel?lp_name=<name>&intake_period=<period>
+// Returns: { odoo_count, odoo_active }  (CRM = same as Odoo, HubSpot integration pending)
+app.get('/api/odoo/students/career-funnel', async (req, res) => {
+  const { lp_name, intake_period } = req.query;
+
+  if (!lp_name || !intake_period) {
+    return res.status(400).json({ error: 'Parámetros requeridos: lp_name, intake_period' });
+  }
+
+  try {
+    const odooApi = new OdooAPI();
+
+    // 1. Resolve Odoo career name from Moodle LP name via career mapping
+    let odooCareerName = lp_name;
+    try {
+      const mappings = await odooApi.call(
+        'moodle.career.mapping',
+        'search_read',
+        [[['moodle_learning_plan_name', '=', lp_name]]],
+        { fields: ['name', 'moodle_learning_plan_name'], limit: 1 }
+      );
+      if (mappings && mappings.length > 0) {
+        odooCareerName = mappings[0].name;
+      }
+    } catch (e) {
+      console.warn('[CAREER_FUNNEL] No se pudo resolver el nombre de carrera en Odoo, usando nombre LP:', e.message);
+    }
+
+    // 2. Query res.partner with career + intake period
+    const domain = [
+      ['x_studio_carrera', '=', odooCareerName],
+      ['x_studio_periodo_de_matricula.name', '=', intake_period],
+    ];
+
+    const allPartners = await odooApi.call(
+      'res.partner',
+      'search_read',
+      [domain],
+      { fields: ['id', 'student_status'], limit: 0 }
+    );
+
+    const odoo_count = allPartners.length;
+    const odoo_active = allPartners.filter(p => p.student_status === 'Activo').length;
+
+    console.log(`[CAREER_FUNNEL] ${lp_name} / ${intake_period}: total=${odoo_count}, activos=${odoo_active}`);
+
+    res.json({ odoo_count, odoo_active, career_name: odooCareerName });
+  } catch (err) {
+    console.error('[CAREER_FUNNEL] Error consultando Odoo:', err.message);
+    res.status(500).json({ error: 'Error consultando datos de Odoo', detail: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 const HOST = '0.0.0.0';
 
