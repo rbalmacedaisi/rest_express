@@ -19,6 +19,11 @@ const MOODLE_LETTERS_WEBHOOK_TOKEN = process.env.MOODLE_LETTERS_WEBHOOK_TOKEN ||
 const ODOO_LETTERS_WEBHOOK_SECRET = process.env.ODOO_LETTERS_WEBHOOK_SECRET || 'gmk_letters_hmac_2026';
 const ODOO_BASE_URL = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
 
+// --- REVÁLIDAS (factura Odoo + webhook de pago) ---
+const MOODLE_REVALID_WEBHOOK_URL = process.env.MOODLE_REVALID_WEBHOOK_URL || `${MOODLE_URL}/local/grupomakro_core/revalida_webhook.php`;
+const MOODLE_REVALID_WEBHOOK_TOKEN = process.env.MOODLE_REVALID_WEBHOOK_TOKEN || MOODLE_LETTERS_WEBHOOK_TOKEN;
+const ODOO_REVALID_WEBHOOK_SECRET = process.env.ODOO_REVALID_WEBHOOK_SECRET || ODOO_LETTERS_WEBHOOK_SECRET;
+
 /**
  * Consult Moodle to check if a student is in their first-login grace period.
  * Returns true if inGrace, false otherwise (including on error — fail open).
@@ -155,6 +160,9 @@ const letterAttachmentCache = new Map();
 const processedLetterWebhookEvents = new Map();
 const LETTER_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+const revalidInvoiceCache = new Map();
+const processedRevalidWebhookEvents = new Map();
+
 function cleanupProcessedLetterEvents() {
   const now = Date.now();
   for (const [key, timestamp] of processedLetterWebhookEvents.entries()) {
@@ -288,6 +296,65 @@ async function findLetterInvoiceByRef(odoo, externalRequestId) {
 }
 
 async function readLetterInvoiceById(odoo, invoiceId) {
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['id', '=', Number(invoiceId)],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+// ----- Reválidas -----
+
+function buildRevalidRef(externalRequestId) {
+  return `REVALID_REQ:${String(externalRequestId).trim()}`;
+}
+
+function signRevalidWebhookPayload(payload) {
+  const canonical = canonicalWebhookPayload(payload);
+  return crypto
+    .createHmac('sha256', ODOO_REVALID_WEBHOOK_SECRET)
+    .update(canonical)
+    .digest('hex');
+}
+
+function verifyRevalidWebhookSignature(payload, signature) {
+  if (!signature) return false;
+  const expected = signRevalidWebhookPayload(payload);
+  const received = String(signature).replace(/^sha256=/i, '').trim().toLowerCase();
+  if (received.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(received, 'hex'), Buffer.from(expected, 'hex'));
+  } catch (error) {
+    return false;
+  }
+}
+
+function cleanupProcessedRevalidEvents() {
+  const now = Date.now();
+  for (const [key, timestamp] of processedRevalidWebhookEvents.entries()) {
+    if (now - timestamp > LETTER_EVENT_TTL_MS) {
+      processedRevalidWebhookEvents.delete(key);
+    }
+  }
+}
+
+async function findRevalidInvoiceByRef(odoo, externalRequestId) {
+  const ref = buildRevalidRef(externalRequestId);
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['ref', '=', ref],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    order: 'id desc',
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+async function readRevalidInvoiceById(odoo, invoiceId) {
   const invoices = await odoo.call('account.move', 'search_read', [[
     ['id', '=', Number(invoiceId)],
     ['move_type', '=', 'out_invoice'],
@@ -557,6 +624,220 @@ app.post('/api/odoo/letters/webhook/payment', async (req, res) => {
     });
   } catch (error) {
     console.error('[letters/webhook/payment] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Crea (o recupera) la factura de reválida en Odoo a partir de un registro de Moodle.
+app.post('/api/odoo/revalidations/invoice', async (req, res) => {
+  try {
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+    const documentNumber = String(req.body?.document_number || '').trim();
+    const amount = Number(req.body?.amount);
+    const requestedProductId = Number(req.body?.odoo_product_id || 0);
+
+    if (!externalRequestId || !documentNumber || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'external_request_id, document_number and amount > 0 are required',
+      });
+    }
+
+    if (revalidInvoiceCache.has(externalRequestId)) {
+      return res.json({
+        ...revalidInvoiceCache.get(externalRequestId),
+        idempotent: true,
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let invoice = await findRevalidInvoiceByRef(odoo, externalRequestId);
+
+    if (!invoice) {
+      const partner = await findPartnerByDocument(odoo, documentNumber);
+      if (!partner) {
+        return res.status(404).json({
+          success: false,
+          error: `partner_not_found_for_document:${documentNumber}`,
+        });
+      }
+
+      const fallbackProductId = Number(process.env.ODOO_REVALID_DEFAULT_PRODUCT_ID || 0);
+      const productId = requestedProductId > 0 ? requestedProductId : fallbackProductId;
+      if (productId <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'odoo_product_id_required',
+        });
+      }
+
+      const lineValues = {
+        name: String(req.body?.description || `Reválida (#${externalRequestId})`),
+        quantity: 1,
+        price_unit: amount,
+        product_id: productId,
+      };
+
+      const invoiceValues = {
+        move_type: 'out_invoice',
+        partner_id: partner.id,
+        ref: buildRevalidRef(externalRequestId),
+        invoice_origin: `REVALID:${externalRequestId}`,
+        invoice_date: new Date().toISOString().slice(0, 10),
+        invoice_line_ids: [[0, 0, lineValues]],
+      };
+
+      const invoiceId = await odoo.call('account.move', 'create', [invoiceValues]);
+      await odoo.call('account.move', 'action_post', [[invoiceId]]);
+      invoice = await readRevalidInvoiceById(odoo, invoiceId);
+    }
+
+    if (!invoice) {
+      return res.status(500).json({
+        success: false,
+        error: 'invoice_not_created',
+      });
+    }
+
+    const responsePayload = {
+      success: true,
+      invoice_id: String(invoice.id),
+      invoice_number: String(invoice.name || ''),
+      payment_link: normalizePaymentLink(invoice.access_url || ''),
+      payment_state: String(invoice.payment_state || 'not_paid'),
+      external_request_id: externalRequestId,
+    };
+    revalidInvoiceCache.set(externalRequestId, responsePayload);
+    res.json(responsePayload);
+  } catch (error) {
+    console.error('[revalidations/invoice] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Verificación on-demand del estado de pago de una factura de reválida.
+app.post('/api/odoo/revalidations/invoice-status', async (req, res) => {
+  try {
+    const invoiceId = String(req.body?.invoice_id || '').trim();
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+
+    if (!invoiceId && !externalRequestId) {
+      return res.status(400).json({
+        success: false,
+        error: 'invoice_id or external_request_id is required',
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let invoice = null;
+    if (invoiceId) {
+      invoice = await readRevalidInvoiceById(odoo, invoiceId);
+    }
+    if (!invoice && externalRequestId) {
+      invoice = await findRevalidInvoiceByRef(odoo, externalRequestId);
+    }
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'invoice_not_found',
+      });
+    }
+
+    const paymentState = String(invoice.payment_state || 'not_paid');
+    res.json({
+      success: true,
+      invoice_id: String(invoice.id),
+      invoice_number: String(invoice.name || ''),
+      payment_state: paymentState,
+      paid: paymentState === 'paid',
+      external_request_id: externalRequestId,
+    });
+  } catch (error) {
+    console.error('[revalidations/invoice-status] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Webhook de Odoo (firmado HMAC) → reenvía a Moodle revalida_webhook.php.
+app.post('/api/odoo/revalidations/webhook/payment', async (req, res) => {
+  try {
+    cleanupProcessedRevalidEvents();
+
+    const payload = req.body || {};
+    const signature = req.headers['x-odoo-signature'] || payload.signature || '';
+    if (!verifyRevalidWebhookSignature(payload, signature)) {
+      return res.status(401).json({
+        success: false,
+        error: 'invalid_signature',
+      });
+    }
+
+    if (String(payload.payment_state || '') !== 'paid') {
+      return res.json({
+        success: true,
+        ignored: true,
+        reason: 'payment_state_not_paid',
+      });
+    }
+
+    const eventKey = [
+      String(payload.invoice_id || ''),
+      String(payload.payment_state || ''),
+      String(payload.event_time || ''),
+      String(payload.external_request_id || ''),
+    ].join('|');
+
+    if (processedRevalidWebhookEvents.has(eventKey)) {
+      return res.json({
+        success: true,
+        idempotent: true,
+        event_key: eventKey,
+      });
+    }
+
+    const moodlePayload = {
+      invoice_id: String(payload.invoice_id || ''),
+      invoice_number: String(payload.invoice_number || ''),
+      payment_state: String(payload.payment_state || ''),
+      partner_vat: String(payload.partner_vat || ''),
+      external_request_id: String(payload.external_request_id || ''),
+      event_time: String(payload.event_time || ''),
+    };
+
+    const moodleResponse = await postJson(
+      MOODLE_REVALID_WEBHOOK_URL,
+      moodlePayload,
+      { 'X-Webhook-Token': MOODLE_REVALID_WEBHOOK_TOKEN }
+    );
+
+    if (moodleResponse.statusCode < 200 || moodleResponse.statusCode >= 300 || moodleResponse.json?.success === false) {
+      console.error('[revalidations/webhook/payment] Moodle webhook failed:', moodleResponse);
+      return res.status(502).json({
+        success: false,
+        error: 'moodle_webhook_failed',
+        moodle_status: moodleResponse.statusCode,
+        moodle_response: moodleResponse.json || moodleResponse.body,
+      });
+    }
+
+    processedRevalidWebhookEvents.set(eventKey, Date.now());
+    res.json({
+      success: true,
+      forwarded: true,
+      moodle: moodleResponse.json || {},
+    });
+  } catch (error) {
+    console.error('[revalidations/webhook/payment] Error:', error);
     res.status(500).json({
       success: false,
       error: error.message,
