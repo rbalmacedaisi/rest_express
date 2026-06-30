@@ -19,10 +19,104 @@ const MOODLE_LETTERS_WEBHOOK_TOKEN = process.env.MOODLE_LETTERS_WEBHOOK_TOKEN ||
 const ODOO_LETTERS_WEBHOOK_SECRET = process.env.ODOO_LETTERS_WEBHOOK_SECRET || 'gmk_letters_hmac_2026';
 const ODOO_BASE_URL = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
 
+// --- MORA / RESTRICCIÓN DE ACCESO AL LXP ---
+// Días de gracia tras el vencimiento antes de restringir el acceso. Por
+// defecto 3; configurable desde Moodle (local_grupomakro_core/overdue_grace_days)
+// vía AJAX (action=local_grupomakro_get_overdue_grace_days) y refrescado cada
+// OVERDUE_GRACE_REFRESH_MS. La variable de entorno OVERDUE_GRACE_DAYS sigue
+// teniendo prioridad sobre el valor de Moodle para casos operativos
+// (mantenimiento, incidentes). Debe coincidir con days_overdue en el cron
+// de facturas de mora de Odoo.
+const OVERDUE_GRACE_FALLBACK = 3;
+const OVERDUE_GRACE_REFRESH_MS = 5 * 60 * 1000;
+let overdueGraceDays = (() => {
+  const env = process.env.OVERDUE_GRACE_DAYS;
+  if (env === undefined || env === '') return null;
+  const parsed = parseInt(env, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+})();
+
+function getOverdueGraceDays() {
+  return overdueGraceDays !== null ? overdueGraceDays : OVERDUE_GRACE_FALLBACK;
+}
+
+// Fecha umbral: una factura solo cuenta como "mora" si venció ANTES de esta
+// fecha (es decir, hace más de los días de gracia configurados). Se normaliza
+// a medianoche local para que el corte sea por día completo, como el cron de Odoo.
+function getOverdueThreshold() {
+  const t = new Date();
+  t.setHours(0, 0, 0, 0);
+  t.setDate(t.getDate() - getOverdueGraceDays());
+  return t;
+}
+
+/**
+ * Consulta a Moodle el valor actual del periodo de gracia de mora y lo cachea
+ * en memoria. No pisa la configuración si la variable de entorno OVERDUE_GRACE_DAYS
+ * está definida (esa tiene prioridad operativa). Fail-open: si Moodle no responde
+ * o devuelve datos inválidos, mantiene el último valor conocido o cae al fallback.
+ */
+async function refreshOverdueGraceFromMoodle() {
+  if (process.env.OVERDUE_GRACE_DAYS && process.env.OVERDUE_GRACE_DAYS !== '') {
+    return;
+  }
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({
+      token: MOODLE_GRACE_TOKEN,
+    });
+    const url = `${MOODLE_URL}/local/grupomakro_core/overdue_grace_days.php?${params}`;
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      rejectUnauthorized: false,
+    };
+    const lib = parsedUrl.protocol === 'https:' ? https : require('http');
+    const req = lib.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json && json.status === 'success' && Number.isFinite(parseInt(json.days, 10))) {
+            const next = parseInt(json.days, 10);
+            if (next !== overdueGraceDays) {
+              console.log(`[MORA] overdueGraceDays actualizado desde Moodle: ${overdueGraceDays} -> ${next}`);
+            }
+            overdueGraceDays = next;
+          } else {
+            const httpStatus = res.statusCode;
+            console.warn(`[MORA] Respuesta inválida de Moodle para overdueGraceDays (HTTP ${httpStatus}): ${data ? data.slice(0, 120) : '<empty>'}; conservando valor actual.`);
+            if (overdueGraceDays === null) overdueGraceDays = OVERDUE_GRACE_FALLBACK;
+          }
+        } catch (e) {
+          console.warn('[MORA] Error parseando respuesta de Moodle para overdueGraceDays:', e.message);
+          if (overdueGraceDays === null) overdueGraceDays = OVERDUE_GRACE_FALLBACK;
+        }
+        resolve();
+      });
+    });
+    req.on('error', (e) => {
+      console.warn(`[MORA] Error consultando overdueGraceDays en Moodle: ${e.message}; conservando valor actual.`);
+      if (overdueGraceDays === null) overdueGraceDays = OVERDUE_GRACE_FALLBACK;
+      resolve();
+    });
+    req.setTimeout(5000, () => { req.destroy(); resolve(); });
+    req.end();
+  });
+}
+
 // --- REVÁLIDAS (factura Odoo + webhook de pago) ---
 const MOODLE_REVALID_WEBHOOK_URL = process.env.MOODLE_REVALID_WEBHOOK_URL || `${MOODLE_URL}/local/grupomakro_core/revalida_webhook.php`;
 const MOODLE_REVALID_WEBHOOK_TOKEN = process.env.MOODLE_REVALID_WEBHOOK_TOKEN || MOODLE_LETTERS_WEBHOOK_TOKEN;
 const ODOO_REVALID_WEBHOOK_SECRET = process.env.ODOO_REVALID_WEBHOOK_SECRET || ODOO_LETTERS_WEBHOOK_SECRET;
+
+// --- MÓDULOS INDEPENDIENTES (factura Odoo + webhook de pago) ---
+const MOODLE_MODULE_WEBHOOK_URL = process.env.MOODLE_MODULE_WEBHOOK_URL || `${MOODLE_URL}/local/grupomakro_core/module_webhook.php`;
+const MOODLE_MODULE_WEBHOOK_TOKEN = process.env.MOODLE_MODULE_WEBHOOK_TOKEN || MOODLE_REVALID_WEBHOOK_TOKEN;
+const ODOO_MODULE_WEBHOOK_SECRET = process.env.ODOO_MODULE_WEBHOOK_SECRET || ODOO_REVALID_WEBHOOK_SECRET;
 
 /**
  * Consult Moodle to check if a student is in their first-login grace period.
@@ -162,6 +256,11 @@ const LETTER_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 const revalidInvoiceCache = new Map();
 const processedRevalidWebhookEvents = new Map();
+
+// --- MÓDULOS ---
+const moduleInvoiceCache = new Map();
+const processedModuleWebhookEvents = new Map();
+const MODULE_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function cleanupProcessedLetterEvents() {
   const now = Date.now();
@@ -355,6 +454,65 @@ async function findRevalidInvoiceByRef(odoo, externalRequestId) {
 }
 
 async function readRevalidInvoiceById(odoo, invoiceId) {
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['id', '=', Number(invoiceId)],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+// ----- Módulos independientes -----
+
+function buildModuleRef(externalRequestId) {
+  return `MODULE_REQ:${String(externalRequestId).trim()}`;
+}
+
+function signModuleWebhookPayload(payload) {
+  const canonical = canonicalWebhookPayload(payload);
+  return crypto
+    .createHmac('sha256', ODOO_MODULE_WEBHOOK_SECRET)
+    .update(canonical)
+    .digest('hex');
+}
+
+function verifyModuleWebhookSignature(payload, signature) {
+  if (!signature) return false;
+  const expected = signModuleWebhookPayload(payload);
+  const received = String(signature).replace(/^sha256=/i, '').trim().toLowerCase();
+  if (received.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(received, 'hex'), Buffer.from(expected, 'hex'));
+  } catch (error) {
+    return false;
+  }
+}
+
+function cleanupProcessedModuleEvents() {
+  const now = Date.now();
+  for (const [key, timestamp] of processedModuleWebhookEvents.entries()) {
+    if (now - timestamp > MODULE_EVENT_TTL_MS) {
+      processedModuleWebhookEvents.delete(key);
+    }
+  }
+}
+
+async function findModuleInvoiceByRef(odoo, externalRequestId) {
+  const ref = buildModuleRef(externalRequestId);
+  const invoices = await odoo.call('account.move', 'search_read', [[
+    ['ref', '=', ref],
+    ['move_type', '=', 'out_invoice'],
+  ]], {
+    fields: ['id', 'name', 'ref', 'partner_id', 'payment_state', 'state', 'access_url'],
+    order: 'id desc',
+    limit: 1,
+  });
+  return invoices && invoices.length ? invoices[0] : null;
+}
+
+async function readModuleInvoiceById(odoo, invoiceId) {
   const invoices = await odoo.call('account.move', 'search_read', [[
     ['id', '=', Number(invoiceId)],
     ['move_type', '=', 'out_invoice'],
@@ -845,6 +1003,224 @@ app.post('/api/odoo/revalidations/webhook/payment', async (req, res) => {
   }
 });
 
+// ============================================================
+// MÓDULOS INDEPENDIENTES
+// ============================================================
+
+// Crea la factura Odoo para una solicitud de módulo. Idempotente por external_request_id.
+app.post('/api/odoo/modules/invoice', async (req, res) => {
+  try {
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+    const documentNumber    = String(req.body?.document_number    || '').trim();
+    const amount            = Number(req.body?.amount);
+    const requestedProductId = Number(req.body?.odoo_product_id || 0);
+
+    if (!externalRequestId || !documentNumber || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'external_request_id, document_number and amount > 0 are required',
+      });
+    }
+
+    if (moduleInvoiceCache.has(externalRequestId)) {
+      return res.json({
+        ...moduleInvoiceCache.get(externalRequestId),
+        idempotent: true,
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let invoice = await findModuleInvoiceByRef(odoo, externalRequestId);
+
+    if (!invoice) {
+      const partner = await findPartnerByDocument(odoo, documentNumber);
+      if (!partner) {
+        return res.status(404).json({
+          success: false,
+          error: `partner_not_found_for_document:${documentNumber}`,
+        });
+      }
+
+      const fallbackProductId = Number(process.env.ODOO_MODULE_DEFAULT_PRODUCT_ID || 0);
+      const productId = requestedProductId > 0 ? requestedProductId : fallbackProductId;
+      if (productId <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'odoo_product_id_required',
+        });
+      }
+
+      const lineValues = {
+        name: String(req.body?.description || `Módulo (#${externalRequestId})`),
+        quantity: 1,
+        price_unit: amount,
+        product_id: productId,
+      };
+
+      const invoiceValues = {
+        move_type: 'out_invoice',
+        partner_id: partner.id,
+        ref: buildModuleRef(externalRequestId),
+        invoice_origin: `MODULE:${externalRequestId}`,
+        invoice_date: new Date().toISOString().slice(0, 10),
+        invoice_line_ids: [[0, 0, lineValues]],
+      };
+
+      const invoiceId = await odoo.call('account.move', 'create', [invoiceValues]);
+      await odoo.call('account.move', 'action_post', [[invoiceId]]);
+      invoice = await readModuleInvoiceById(odoo, invoiceId);
+    }
+
+    if (!invoice) {
+      return res.status(500).json({
+        success: false,
+        error: 'invoice_not_created',
+      });
+    }
+
+    const responsePayload = {
+      success: true,
+      invoice_id: String(invoice.id),
+      invoice_number: String(invoice.name || ''),
+      payment_link: normalizePaymentLink(invoice.access_url || ''),
+      payment_state: String(invoice.payment_state || 'not_paid'),
+      external_request_id: externalRequestId,
+    };
+    moduleInvoiceCache.set(externalRequestId, responsePayload);
+    res.json(responsePayload);
+  } catch (error) {
+    console.error('[modules/invoice] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Verificación on-demand del estado de pago de una factura de módulo.
+app.post('/api/odoo/modules/invoice-status', async (req, res) => {
+  try {
+    const invoiceId        = String(req.body?.invoice_id || '').trim();
+    const externalRequestId = String(req.body?.external_request_id || '').trim();
+
+    if (!invoiceId && !externalRequestId) {
+      return res.status(400).json({
+        success: false,
+        error: 'invoice_id or external_request_id is required',
+      });
+    }
+
+    const odoo = new OdooAPI();
+    let invoice = null;
+    if (invoiceId) {
+      invoice = await readModuleInvoiceById(odoo, invoiceId);
+    }
+    if (!invoice && externalRequestId) {
+      invoice = await findModuleInvoiceByRef(odoo, externalRequestId);
+    }
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'invoice_not_found',
+      });
+    }
+
+    const paymentState = String(invoice.payment_state || 'not_paid');
+    res.json({
+      success: true,
+      invoice_id: String(invoice.id),
+      invoice_number: String(invoice.name || ''),
+      payment_state: paymentState,
+      paid: paymentState === 'paid',
+      external_request_id: externalRequestId,
+    });
+  } catch (error) {
+    console.error('[modules/invoice-status] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Webhook de Odoo (firmado HMAC) → reenvía a Moodle module_webhook.php.
+app.post('/api/odoo/modules/webhook/payment', async (req, res) => {
+  try {
+    cleanupProcessedModuleEvents();
+
+    const payload    = req.body || {};
+    const signature  = req.headers['x-odoo-signature'] || payload.signature || '';
+    if (!verifyModuleWebhookSignature(payload, signature)) {
+      return res.status(401).json({
+        success: false,
+        error: 'invalid_signature',
+      });
+    }
+
+    if (String(payload.payment_state || '') !== 'paid') {
+      return res.json({
+        success: true,
+        ignored: true,
+        reason: 'payment_state_not_paid',
+      });
+    }
+
+    const eventKey = [
+      String(payload.invoice_id || ''),
+      String(payload.payment_state || ''),
+      String(payload.event_time || ''),
+      String(payload.external_request_id || ''),
+    ].join('|');
+
+    if (processedModuleWebhookEvents.has(eventKey)) {
+      return res.json({
+        success: true,
+        idempotent: true,
+        event_key: eventKey,
+      });
+    }
+
+    const moodlePayload = {
+      invoice_id: String(payload.invoice_id || ''),
+      invoice_number: String(payload.invoice_number || ''),
+      payment_state: String(payload.payment_state || ''),
+      partner_vat: String(payload.partner_vat || ''),
+      external_request_id: String(payload.external_request_id || ''),
+      event_time: String(payload.event_time || ''),
+    };
+
+    const moodleResponse = await postJson(
+      MOODLE_MODULE_WEBHOOK_URL,
+      moodlePayload,
+      { 'X-Webhook-Token': MOODLE_MODULE_WEBHOOK_TOKEN }
+    );
+
+    if (moodleResponse.statusCode < 200 || moodleResponse.statusCode >= 300 || moodleResponse.json?.success === false) {
+      console.error('[modules/webhook/payment] Moodle webhook failed:', moodleResponse);
+      return res.status(502).json({
+        success: false,
+        error: 'moodle_webhook_failed',
+        moodle_status: moodleResponse.statusCode,
+        moodle_response: moodleResponse.json || moodleResponse.body,
+      });
+    }
+
+    processedModuleWebhookEvents.set(eventKey, Date.now());
+    res.json({
+      success: true,
+      forwarded: true,
+      moodle: moodleResponse.json || {},
+    });
+  } catch (error) {
+    console.error('[modules/webhook/payment] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 app.get('/api/odoo/invoices', async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
@@ -1102,12 +1478,12 @@ app.get('/api/odoo/status', async (req, res) => {
       return res.json(result);
     }
 
-    // Filtrar MORA
-    const now = new Date();
+    // Filtrar MORA: solo facturas vencidas hace más de los días de gracia configurados (Moodle o env)
+    const overdueThreshold = getOverdueThreshold();
     const overdue = invoices.filter(inv =>
       inv.state !== 'paid' &&
       inv.invoice_date_due &&
-      new Date(inv.invoice_date_due) < now &&
+      new Date(inv.invoice_date_due) < overdueThreshold &&
       inv.amount_residual > 0
     );
 
@@ -1226,7 +1602,8 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
 
     const docToPartnerId = {}; // doc -> partner_id
     const partnerIdsNeedInvoices = [];
-    const now = new Date();
+    // Solo facturas vencidas hace más de los días de gracia configurados (Moodle o env) cuentan como mora
+    const overdueThreshold = getOverdueThreshold();
 
     for (const doc of toFetch) {
       const partner = partnerMap[doc];
@@ -1282,7 +1659,7 @@ app.post('/api/odoo/status/bulk', async (req, res) => {
           const overdue = studentInvoices.filter(inv =>
             inv.state !== 'paid' &&
             inv.invoice_date_due &&
-            new Date(inv.invoice_date_due) < now &&
+            new Date(inv.invoice_date_due) < overdueThreshold &&
             inv.amount_residual > 0
           );
 
@@ -1541,6 +1918,12 @@ const httpsOptions = {
   key: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/privkey.pem'),
   cert: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/fullchain.pem')
 };
+
+// Inicialización y refresco periódico del valor de mora desde Moodle
+refreshOverdueGraceFromMoodle().catch(() => {});
+setInterval(() => {
+  refreshOverdueGraceFromMoodle().catch(() => {});
+}, OVERDUE_GRACE_REFRESH_MS);
 
 // Crear servidor HTTPS
 https.createServer(httpsOptions, app).listen(PORT, HOST, () => {
