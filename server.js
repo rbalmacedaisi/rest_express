@@ -1221,6 +1221,50 @@ app.post('/api/odoo/modules/webhook/payment', async (req, res) => {
   }
 });
 
+// Verifica si un product.product existe en Odoo. Usado por Moodle para
+// validar antes de crear una factura (evita errores XML-RPC feos al usuario).
+app.get('/api/odoo/products/exists', async (req, res) => {
+  try {
+    const productId = parseInt(req.query.product_id, 10);
+    if (!Number.isFinite(productId) || productId <= 0) {
+      return res.status(400).json({
+        success: false,
+        exists: false,
+        error: 'product_id must be a positive integer',
+      });
+    }
+    const odoo = new OdooAPI();
+    const products = await odoo.call('product.product', 'read', [[productId]], {
+      fields: ['id', 'name', 'list_price', 'default_code', 'active'],
+    });
+    if (!Array.isArray(products) || products.length === 0) {
+      return res.json({
+        success: true,
+        exists: false,
+        id: productId,
+        error: 'product_not_found',
+      });
+    }
+    const p = products[0];
+    return res.json({
+      success: true,
+      exists: true,
+      id: p.id,
+      name: p.name || '',
+      list_price: p.list_price || 0,
+      default_code: p.default_code || '',
+      active: !!p.active,
+    });
+  } catch (error) {
+    console.error('[products/exists] Error:', error);
+    return res.status(500).json({
+      success: false,
+      exists: false,
+      error: error.message,
+    });
+  }
+});
+
 app.get('/api/odoo/invoices', async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
