@@ -118,6 +118,9 @@ const MOODLE_MODULE_WEBHOOK_URL = process.env.MOODLE_MODULE_WEBHOOK_URL || `${MO
 const MOODLE_MODULE_WEBHOOK_TOKEN = process.env.MOODLE_MODULE_WEBHOOK_TOKEN || MOODLE_REVALID_WEBHOOK_TOKEN;
 const ODOO_MODULE_WEBHOOK_SECRET = process.env.ODOO_MODULE_WEBHOOK_SECRET || ODOO_REVALID_WEBHOOK_SECRET;
 
+// --- INVALIDACIÓN DE CACHÉ POR PAGO (módulo moodle_invoice_payment_webhook) ---
+const ODOO_PAYMENT_WEBHOOK_SECRET = process.env.ODOO_PAYMENT_WEBHOOK_SECRET || 'gmk_payment_invalidate_2026';
+
 /**
  * Consult Moodle to check if a student is in their first-login grace period.
  * Returns true if inGrace, false otherwise (including on error — fail open).
@@ -225,27 +228,77 @@ app.use((req, res, next) => {
 app.use(cors());
 app.use(express.json());
 
-// --- CACHE IMPLEMENTATION ---
-const studentStatusCache = new Map();
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// --- CACHE IMPLEMENTATION (asimétrica) ---
+// Razones que significan "puede acceder". Se cachean por 24h porque un cambio
+// de estado positivo casi nunca se invalida solo; si se paga una factura
+// estando ya al día no afecta al resultado.
+const POSITIVE_REASONS = new Set([
+  'al_dia',
+  'contrato_especial',
+  'periodo_gracia',
+  'beca',
+  'becado',
+  'bypass_financiero',
+]);
+// Razones negativas ("mora", "sincontrato"...) se cachean por solo 5 min,
+// para que un pago o un cambio de vencimiento libere al estudiante rápido
+// incluso si el webhook de Odoo no llega.
+const CACHE_TTL_POS_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_NEG_MS = 5 * 60 * 1000;       // 5 minutes
 
-// Helper to get from cache
-function getCachedStatus(documentNumber) {
-  if (!studentStatusCache.has(documentNumber)) return null;
-  const { timestamp, data } = studentStatusCache.get(documentNumber);
-  if (Date.now() - timestamp > CACHE_TTL_MS) {
-    studentStatusCache.delete(documentNumber);
-    return null;
-  }
-  return data;
+const studentStatusCachePos = new Map();
+const studentStatusCacheNeg = new Map();
+
+function pickCache(documentNumber, reason) {
+  return POSITIVE_REASONS.has(reason) ? studentStatusCachePos : studentStatusCacheNeg;
 }
 
-// Helper to set cache
+function ttlForCache(cache) {
+  return cache === studentStatusCachePos ? CACHE_TTL_POS_MS : CACHE_TTL_NEG_MS;
+}
+
+// Helper to get from cache (busca primero en positiva, luego en negativa).
+function getCachedStatus(documentNumber) {
+  for (const cache of [studentStatusCachePos, studentStatusCacheNeg]) {
+    if (!cache.has(documentNumber)) continue;
+    const { timestamp, data } = cache.get(documentNumber);
+    if (Date.now() - timestamp > ttlForCache(cache)) {
+      cache.delete(documentNumber);
+      continue;
+    }
+    return data;
+  }
+  return null;
+}
+
+// Helper to set cache (routeo automático según la razón).
 function setCachedStatus(documentNumber, data) {
-  studentStatusCache.set(documentNumber, {
+  const reason = data && data.reason;
+  const cache = pickCache(documentNumber, reason);
+  cache.set(documentNumber, {
     timestamp: Date.now(),
     data
   });
+}
+
+// Helper para invalidar un documento concreto (usado por el webhook de Odoo
+// y por /api/odoo/cache/clear). Devuelve true si había alguna entrada.
+function invalidateCachedStatus(documentNumber) {
+  if (!documentNumber) return false;
+  const hadPos = studentStatusCachePos.delete(documentNumber);
+  const hadNeg = studentStatusCacheNeg.delete(documentNumber);
+  return hadPos || hadNeg;
+}
+
+// Helper para limpiar toda la caché (usado por endpoints admin).
+function clearAllCachedStatus() {
+  studentStatusCachePos.clear();
+  studentStatusCacheNeg.clear();
+}
+
+// Tamaño observable de la caché combinada (para diagnóstico).
+function cachedStatusSize() {
+  return studentStatusCachePos.size + studentStatusCacheNeg.size;
 }
 
 // --- LETTER REQUESTS (Moodle <-> Express <-> Odoo) ---
@@ -510,6 +563,41 @@ async function findModuleInvoiceByRef(odoo, externalRequestId) {
     limit: 1,
   });
   return invoices && invoices.length ? invoices[0] : null;
+}
+
+// ----- Invalidación de caché por pago (módulo Odoo moodle_invoice_payment_webhook) -----
+
+function canonicalInvalidatePayload(payload) {
+  const source = payload || {};
+  const normalized = {
+    partner_vat: String(source.partner_vat || ''),
+    invoice_id:  String(source.invoice_id  || ''),
+    reason:      String(source.reason      || ''),
+    event_time:  String(source.event_time  || ''),
+  };
+  return JSON.stringify(normalized);
+}
+
+function signInvalidatePayload(payload) {
+  return crypto
+    .createHmac('sha256', ODOO_PAYMENT_WEBHOOK_SECRET)
+    .update(canonicalInvalidatePayload(payload))
+    .digest('hex');
+}
+
+function verifyInvalidateSignature(payload, signature) {
+  if (!signature) return false;
+  const expected = signInvalidatePayload(payload);
+  const received = String(signature).replace(/^sha256=/i, '').trim().toLowerCase();
+  if (received.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(received, 'hex'),
+      Buffer.from(expected, 'hex'),
+    );
+  } catch (error) {
+    return false;
+  }
 }
 
 async function readModuleInvoiceById(odoo, invoiceId) {
@@ -1731,19 +1819,61 @@ app.post('/api/odoo/cache/clear', (req, res) => {
   const documentNumber = req.body.documentNumber;
 
   if (documentNumber) {
-    if (studentStatusCache.has(documentNumber)) {
-      studentStatusCache.delete(documentNumber);
-      console.log(`[CACHE] Limpiado manualmente para: ${documentNumber}`);
-      return res.json({ success: true, message: `Caché limpiado para ${documentNumber}` });
-    } else {
-      return res.json({ success: true, message: `No había caché para ${documentNumber}` });
-    }
+    const removed = invalidateCachedStatus(documentNumber);
+    console.log(`[CACHE] Limpiado manualmente para: ${documentNumber} (${removed ? 'REMOVED' : 'no_entry'})`);
+    return res.json({
+      success: true,
+      message: removed ? `Caché limpiado para ${documentNumber}` : `No había caché para ${documentNumber}`,
+      removed,
+    });
   } else {
     // Limpiar todo (opcional, para admin)
-    studentStatusCache.clear();
+    clearAllCachedStatus();
     console.log(`[CACHE] Todo el caché ha sido limpiado.`);
     return res.json({ success: true, message: 'Todo el caché ha sido limpiado' });
   }
+});
+
+// POST /api/odoo/cache/invalidate — webhook (HMAC) desde el módulo Odoo
+// moodle_invoice_payment_webhook. Se dispara cuando se paga / cambia el
+// vencimiento / se anula una factura regular, o cuando se modifica el tipo de
+// contrato especial (beca/IFARHU) de un partner. Invalida la entrada de caché
+// del estudiante afectado (positiva o negativa) para que el próximo
+// checkStudentStatus desde el LXP recalcule contra Odoo.
+app.post('/api/odoo/cache/invalidate', (req, res) => {
+  const payload = req.body || {};
+  const signature = req.headers['x-odoo-signature'] || payload.signature || '';
+  if (!verifyInvalidateSignature(payload, signature)) {
+    return res.status(401).json({
+      success: false,
+      error: 'invalid_signature',
+    });
+  }
+
+  const partnerVat = String(payload.partner_vat || '').trim();
+  if (!partnerVat) {
+    return res.status(400).json({
+      success: false,
+      error: 'partner_vat_required',
+    });
+  }
+
+  const reason = String(payload.reason || '');
+  const invoiceId = String(payload.invoice_id || '');
+  const removed = invalidateCachedStatus(partnerVat);
+
+  console.log(
+    `[CACHE] Invalidate ${partnerVat} reason=${reason || '<none>'} invoice=${invoiceId || '<none>'}: ${removed ? 'REMOVED' : 'no_entry'} (size=${cachedStatusSize()})`,
+  );
+
+  return res.json({
+    success: true,
+    partner_vat: partnerVat,
+    removed,
+    reason,
+    invoice_id: invoiceId,
+    cache_size: cachedStatusSize(),
+  });
 });
 
 // POST /api/odoo/profile/update — actualiza teléfono y/o fecha de nacimiento en Odoo
@@ -1845,7 +1975,7 @@ app.post('/api/admin/bypass', adminAuth, (req, res) => {
 
   // Si se activa el bypass, limpiar toda la caché para que no haya residuos
   if (enabled) {
-    studentStatusCache.clear();
+    clearAllCachedStatus();
     console.log('[BYPASS] Caché limpiada al activar bypass');
   }
 
@@ -1885,7 +2015,7 @@ app.post('/api/admin/financial-source', adminAuth, (req, res) => {
   saveFinancialSourceConfig(financialSourceConfig);
 
   // Clear cache when switching source to avoid stale results
-  studentStatusCache.clear();
+  clearAllCachedStatus();
   console.log(`[FINANCIAL_SOURCE] Fuente cambiada de "${prev}" a "${source}" por: ${financialSourceConfig.updatedBy}`);
 
   // Pre-initialize Q10 session in background when switching to Q10

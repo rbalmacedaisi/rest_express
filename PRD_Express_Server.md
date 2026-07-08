@@ -168,15 +168,42 @@ Verifica el estado de múltiples estudiantes.
 
 #### 4.1.3 POST /api/odoo/cache/clear
 
-Limpia la caché de estados.
+Limpia la caché de estados (positiva y negativa).
 
 **Body**:
 ```json
 {
   "documentNumber": "12345678"
 }
+```
 // o vacío para limpiar todo
 ```
+
+#### 4.1.4 POST /api/odoo/cache/invalidate
+
+Webhook HMAC que el módulo Odoo `moodle_invoice_payment_webhook` invoca cuando se paga, cambia el vencimiento o se anula una factura regular, o cuando se modifica el tipo de contrato especial del partner. Invalida la entrada de caché del estudiante (positiva o negativa) para que el próximo `checkStudentStatus` recalcule contra Odoo.
+
+**Headers**:
+- `x-odoo-signature`: `<hex>` (HMAC-SHA256 sobre el payload canónico)
+
+**Body**:
+```json
+{
+  "partner_vat": "8-123-4567",
+  "invoice_id":  12345,
+  "reason":      "invoice_paid",
+  "event_time":  "2026-07-08T14:32:11"
+}
+```
+
+`reason` puede ser `invoice_paid`, `invoice_due_date_changed`, `invoice_cancelled` o `contract_type_changed`.
+
+**Respuesta**:
+```json
+{ "success": true, "partner_vat": "8-123-4567", "removed": true, "reason": "invoice_paid", "invoice_id": "12345", "cache_size": 0 }
+```
+
+Idempotente: si no había entrada para ese `partner_vat`, devuelve `removed: false`.
 
 ---
 
