@@ -2030,6 +2030,141 @@ app.post('/api/admin/financial-source', adminAuth, (req, res) => {
   });
 });
 
+// --- LXP CALENDAR PROXY (moodle WS local_grupomakro_calendar_get_calendar_events) ---
+// Server-side cache for the slow Moodle calendar WS. The LXP frontend now
+// sends a visible [initDate, endDate] window so we only forward that range.
+// Cache TTL is short (60s) because reschedules and new attendance sessions
+// can shift the data quickly. Bypassed entirely when admin override is sent.
+
+const CALENDAR_CACHE_TTL_MS = 60 * 1000;
+const calendarCache = new Map(); // key = `${userId}|${initDate}|${endDate}` -> { ts, payload }
+
+function calendarCacheKey(userId, initDate, endDate) {
+  return `${userId || 0}|${initDate || ''}|${endDate || ''}`;
+}
+
+function calendarCacheGet(userId, initDate, endDate) {
+  const key = calendarCacheKey(userId, initDate, endDate);
+  const entry = calendarCache.get(key);
+  if (!entry) return null;
+  if ((Date.now() - entry.ts) > CALENDAR_CACHE_TTL_MS) {
+    calendarCache.delete(key);
+    return null;
+  }
+  return entry.payload;
+}
+
+function calendarCacheSet(userId, initDate, endDate, payload) {
+  const key = calendarCacheKey(userId, initDate, endDate);
+  calendarCache.set(key, { ts: Date.now(), payload });
+  // Bound the cache size to avoid memory bloat on long-running processes.
+  if (calendarCache.size > 5000) {
+    const firstKey = calendarCache.keys().next().value;
+    if (firstKey !== undefined) calendarCache.delete(firstKey);
+  }
+}
+
+/**
+ * POST application/x-www-form-urlencoded to the Moodle REST endpoint and
+ * resolve with the parsed JSON response. Used by the calendar proxy and any
+ * future proxy we add.
+ */
+function httpsPostJson(urlString, paramsObj, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(paramsObj).toString();
+    const url = new URL(urlString);
+    const lib = url.protocol === 'https:' ? https : require('http');
+    const req = lib.request({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      rejectUnauthorized: false,
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Moodle WS returned non-JSON (HTTP ${res.statusCode}): ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Moodle WS timeout after ${timeoutMs}ms`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+app.get('/api/lxp/calendar', async (req, res) => {
+  const userToken = req.query.wstoken || req.headers['x-moodle-token'];
+  const userId = parseInt(req.query.userId || '0', 10) || 0;
+  const initDate = typeof req.query.initDate === 'string' ? req.query.initDate : '';
+  const endDate = typeof req.query.endDate === 'string' ? req.query.endDate : '';
+  const bypass = req.query.bypass === '1' || req.query.bypass === 'true';
+
+  if (!userToken) {
+    return res.status(400).json({ status: -1, message: 'Missing wstoken' });
+  }
+
+  // Cache lookup (skipped when bypass=1).
+  if (!bypass) {
+    const cached = calendarCacheGet(userId, initDate, endDate);
+    if (cached) {
+      res.set('X-LXP-Cache', 'HIT');
+      res.set('Cache-Control', 'private, max-age=30');
+      return res.json(cached);
+    }
+  }
+
+  const params = {
+    wstoken: userToken,
+    wsfunction: 'local_grupomakro_calendar_get_calendar_events',
+    moodlewsrestformat: 'json',
+  };
+  if (userId > 0) params.userId = String(userId);
+  if (initDate) params.initDate = initDate;
+  if (endDate) params.endDate = endDate;
+
+  try {
+    const moodleRes = await httpsPostJson(
+      `${MOODLE_URL}/webservice/rest/server.php`,
+      params
+    );
+    // Moodle error envelope.
+    if (moodleRes && moodleRes.exception) {
+      return res.status(502).json({
+        status: -1,
+        message: moodleRes.message || moodleRes.errorcode || 'Moodle WS error',
+      });
+    }
+    if (!bypass) calendarCacheSet(userId, initDate, endDate, moodleRes);
+    res.set('X-LXP-Cache', bypass ? 'BYPASS' : 'MISS');
+    res.set('Cache-Control', 'private, max-age=30');
+    return res.json(moodleRes);
+  } catch (err) {
+    console.error('[LXP_CALENDAR] Error contacting Moodle WS:', err.message);
+    return res.status(502).json({ status: -1, message: err.message });
+  }
+});
+
+// Admin endpoint to invalidate the calendar cache (e.g. after a reschedule
+// broadcast). Use sparingly: TTL of 60s makes manual purges rare.
+app.post('/api/lxp/calendar/invalidate', adminAuth, (req, res) => {
+  const before = calendarCache.size;
+  calendarCache.clear();
+  console.log(`[LXP_CALENDAR] admin invalidated cache: ${before} entries purged`);
+  res.json({ ok: true, purged: before });
+});
+
 // --- STUDENT CAREER FUNNEL (for student_timeline page in Moodle) ---
 // GET /api/odoo/students/career-funnel?lp_name=<name>&intake_period=<period>
 // Returns: { odoo_count, odoo_active }  (CRM = same as Odoo, HubSpot integration pending)
