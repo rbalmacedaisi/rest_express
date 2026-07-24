@@ -4,7 +4,7 @@ const { URL } = require('url'); // Importa la clase URL
 
 // Usa variables de entorno o valores por defecto
 const ODOO_URL_BASE = process.env.ODOO_URL || 'https://odoo.isi.edu.pa'; // Guarda la URL base
-const ODOO_DB = process.env.ODOO_DB || 'odoo';
+const ODOO_DB = process.env.ODOO_DB || 'odoo_staging';
 const ODOO_USER = process.env.ODOO_USER || 'tic@isi.edu.pa';
 const ODOO_APIKEY = process.env.ODOO_APIKEY || '3b2a6fa21d721f678eaf8551ac04a280099e97a7';
 
@@ -16,16 +16,16 @@ class OdooAPI {
             host: urlParts.hostname,
             port: urlParts.port || (urlParts.protocol === 'https:' ? 443 : 80),
             rejectUnauthorized: process.env.NODE_ENV !== 'development', // Deshabilita en dev si tienes problemas con certs auto-firmados
-            request: { // Opciones adicionales para la petición HTTP subyacente si es necesario
+            request: { // Opciones adicionales para la peticiï¿½n HTTP subyacente si es necesario
                 timeout: 10000 // 10 segundos de timeout
             }
         };
 
-        // Crea clientes con rutas específicas y configura para HTTPS
+        // Crea clientes con rutas especï¿½ficas y configura para HTTPS
         if (urlParts.protocol === 'https:') {
             this.commonClient = xmlrpc.createSecureClient({ ...baseOptions, path: '/xmlrpc/2/common' });
             this.objectClient = xmlrpc.createSecureClient({ ...baseOptions, path: '/xmlrpc/2/object' });
-        } else { // Si fuera HTTP (no es tu caso aquí)
+        } else { // Si fuera HTTP (no es tu caso aquï¿½)
             this.commonClient = xmlrpc.createClient({ ...baseOptions, path: '/xmlrpc/2/common' });
             this.objectClient = xmlrpc.createClient({ ...baseOptions, path: '/xmlrpc/2/object' });
         }
@@ -41,7 +41,7 @@ class OdooAPI {
     async authenticate() {
         console.log(`[OdooAPI] Intentando autenticar a Odoo DB: ${this.db}, User: ${this.username}`);
         return new Promise((resolve, reject) => {
-            // Llama solo con el nombre del método Odoo, los parámetros y el callback
+            // Llama solo con el nombre del mï¿½todo Odoo, los parï¿½metros y el callback
             this.commonClient.methodCall('authenticate', [this.db, this.username, this.apiKey, {}], (err, uid) => {
                 if (err) {
                     console.error('[OdooAPI Authenticate Error]:', err);
@@ -50,7 +50,7 @@ class OdooAPI {
                     }
                     return reject(err);
                 }
-                console.log(`[OdooAPI] Autenticación exitosa. UID: ${uid}`);
+                console.log(`[OdooAPI] Autenticaciï¿½n exitosa. UID: ${uid}`);
                 this.uid = uid;
                 resolve(uid);
             });
@@ -63,7 +63,7 @@ class OdooAPI {
             try {
                 await this.authenticate();
             } catch (authError) {
-                console.error('[OdooAPI] Falló la autenticación antes de la llamada:', authError);
+                console.error('[OdooAPI] Fallï¿½ la autenticaciï¿½n antes de la llamada:', authError);
                 throw new Error('Authentication failed before Odoo API call.');
             }
         }
@@ -71,7 +71,7 @@ class OdooAPI {
         console.log(`[OdooAPI] Llamando a Odoo: Model: ${model}, Method: ${method}, Args: ${JSON.stringify(args)}, Kwargs: ${JSON.stringify(kwargs)}`);
 
         return new Promise((resolve, reject) => {
-            // Llama solo con el nombre del método Odoo, los parámetros y el callback
+            // Llama solo con el nombre del mï¿½todo Odoo, los parï¿½metros y el callback
             this.objectClient.methodCall(
                 'execute_kw',
                 [this.db, this.uid, this.apiKey, model, method, args, kwargs],
