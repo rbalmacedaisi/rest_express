@@ -15,10 +15,10 @@
  *   POST /api/odoo/students/retirar
  *     -> invokes the same Odoo wizard with action='retiro'. Same body shape.
  *
- * Auth: optional X-Api-Key middleware. If process.env.ODOO_API_KEY is set,
- * any request without a matching header is rejected with 401. If unset
- * (current default for the open endpoints), the middleware is a no-op so the
- * cron Moodle->status/bulk keeps working unchanged.
+ * Auth: optional X-Api-Key middleware, scoped to /api/odoo/students/* ONLY.
+ * Legacy endpoints under /api/odoo (status/bulk, products/exists, ...) stay
+ * open for the cron and LXP store to keep working unchanged. When unset
+ * (current default for the open endpoints), the middleware is a no-op.
  */
 
 const express = require('express');
@@ -32,10 +32,13 @@ const router = express.Router();
 // in Moodle as 'local_grupomakro_core | odoo_proxy_api_key' and in Odoo
 // as 'ir.config_parameter subscription_oca.api_key' for the matching
 // authorisation in aplazo_api.py. When unset, the endpoints stay open
-// (matching the legacy behaviour of /api/odoo/status/bulk).
+// (matching the legacy behaviour).
 const ODOO_PROXY_API_KEY = process.env.ODOO_PROXY_API_KEY || '';
 
-router.use((req, res, next) => {
+// SCOPED auth: only apply to /api/odoo/students/* routes. Legacy
+// endpoints under /api/odoo/* (status, products, etc.) keep their open
+// access for the cron and LXP store.
+router.use('/students', (req, res, next) => {
     if (!ODOO_PROXY_API_KEY) return next();
     const provided = req.header('X-Api-Key') || req.header('x-api-key');
     if (!provided || provided !== ODOO_PROXY_API_KEY) {
