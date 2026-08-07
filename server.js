@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const OdooAPI = require('./odooApi');
 const q10Api  = require('./q10Api');
+const odooStudentsRouter = require('./odoo_students');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -227,6 +228,11 @@ app.use((req, res, next) => {
 
 app.use(cors());
 app.use(express.json());
+
+// LXP -> Express -> Odoo endpoints (aplazar / retirar / pending-invoices).
+// Auth: optional X-Api-Key (see odoo_students.js). Existing /api/odoo/* routes
+// below are intentionally left untouched.
+app.use('/api/odoo', odooStudentsRouter);
 
 // --- CACHE IMPLEMENTATION (asimétrica) ---
 // Razones que significan "puede acceder". Se cachean por 24h porque un cambio
