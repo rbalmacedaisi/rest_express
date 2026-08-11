@@ -122,6 +122,26 @@ const ODOO_MODULE_WEBHOOK_SECRET = process.env.ODOO_MODULE_WEBHOOK_SECRET || ODO
 // --- INVALIDACIÓN DE CACHÉ POR PAGO (módulo moodle_invoice_payment_webhook) ---
 const ODOO_PAYMENT_WEBHOOK_SECRET = process.env.ODOO_PAYMENT_WEBHOOK_SECRET || 'gmk_payment_invalidate_2026';
 
+// --- PUSH A MOODLE PARA REFRESCAR gmk_financial_status ---
+// Después de invalidar el caché de Express, también empujamos el cambio a
+// Moodle vía su propio endpoint HMAC para que el snapshot que usa el
+// academicpanel se actualice en tiempo real (no esperar al cron 6h).
+const MOODLE_FINANCIAL_WEBHOOK_URL =
+  process.env.MOODLE_FINANCIAL_WEBHOOK_URL ||
+  `${MOODLE_URL}/local/grupomakro_core/pages/financial_webhook.php`;
+const MOODLE_FINANCIAL_WEBHOOK_SECRET =
+  process.env.MOODLE_FINANCIAL_WEBHOOK_SECRET || ODOO_PAYMENT_WEBHOOK_SECRET;
+
+// Dedupe por VAT: si llega otro invalidate para el mismo VAT en menos de
+// 30 segundos, NO re-llamamos a Moodle. La primera llamada ya invalido el
+// snapshot Moodle; el webhook actual solo refrescaria con la misma data.
+// (Defensa contra rafagas tipo cierre de caja POS: N pagos mismo estudiante.)
+const MOODLE_PUSH_DEDUPE_MS = 30 * 1000;
+
+// Rate limit: máximo 5 pushes/segundo a Moodle para no saturarlo.
+const MOODLE_PUSH_RATE_PER_SEC = 5;
+const moodlePushTimestamps = []; // timestamps de los ultimos pushes enviados
+
 /**
  * Consult Moodle to check if a student is in their first-login grace period.
  * Returns true if inGrace, false otherwise (including on error — fail open).
@@ -1846,6 +1866,12 @@ app.post('/api/odoo/cache/clear', (req, res) => {
 // contrato especial (beca/IFARHU) de un partner. Invalida la entrada de caché
 // del estudiante afectado (positiva o negativa) para que el próximo
 // checkStudentStatus desde el LXP recalcule contra Odoo.
+//
+// Adicionalmente, desde 2026-08, propaga el cambio a Moodle via
+// MOODLE_FINANCIAL_WEBHOOK_URL para que el snapshot que alimenta el
+// academicpanel (gmk_financial_status) se actualice en tiempo real.
+// La llamada a Moodle es fire-and-forget: si falla, la respuesta al
+// caller sigue siendo success=true (la invalidacion local ya se hizo).
 app.post('/api/odoo/cache/invalidate', (req, res) => {
   const payload = req.body || {};
   const signature = req.headers['x-odoo-signature'] || payload.signature || '';
@@ -1872,6 +1898,9 @@ app.post('/api/odoo/cache/invalidate', (req, res) => {
     `[CACHE] Invalidate ${partnerVat} reason=${reason || '<none>'} invoice=${invoiceId || '<none>'}: ${removed ? 'REMOVED' : 'no_entry'} (size=${cachedStatusSize()})`,
   );
 
+  // Propagar a Moodle (fire-and-forget con dedupe + rate limit).
+  const pushResult = pushFinancialStatusToMoodle(partnerVat, payload);
+
   return res.json({
     success: true,
     partner_vat: partnerVat,
@@ -1879,8 +1908,80 @@ app.post('/api/odoo/cache/invalidate', (req, res) => {
     reason,
     invoice_id: invoiceId,
     cache_size: cachedStatusSize(),
+    moodle_push: pushResult,
   });
 });
+
+// ---------------------------------------------------------------------------
+// Push fire-and-forget a Moodle para refrescar gmk_financial_status por VAT.
+// Dedupe por VAT en ventana de 30s (no empuja si ya empujamos este VAT hace
+// poco) + rate limit global de MOODLE_PUSH_RATE_PER_SEC.
+// Devuelve metadata para que el caller sepa si se dedupeo, rate-limito,
+// fallo o se envio OK.
+// ---------------------------------------------------------------------------
+const moodlePushLastByVat = new Map(); // vat -> epoch ms del ultimo push
+
+function pushFinancialStatusToMoodle(partnerVat, originalPayload) {
+  const now = Date.now();
+
+  // Dedupe por VAT.
+  const last = moodlePushLastByVat.get(partnerVat) || 0;
+  if (now - last < MOODLE_PUSH_DEDUPE_MS) {
+    return { skipped: 'deduped_within_30s', ms_since_last: now - last };
+  }
+
+  // Rate limit global (rolling 1s).
+  while (moodlePushTimestamps.length > 0 && now - moodlePushTimestamps[0] > 1000) {
+    moodlePushTimestamps.shift();
+  }
+  if (moodlePushTimestamps.length >= MOODLE_PUSH_RATE_PER_SEC) {
+    return { skipped: 'rate_limited', in_flight: moodlePushTimestamps.length };
+  }
+
+  // Construir el payload que espera Moodle (mismo formato que el webhook Odoo).
+  const moodlePayload = {
+    partner_vat: partnerVat,
+    invoice_id:  String(originalPayload.invoice_id || ''),
+    reason:      String(originalPayload.reason || ''),
+    event_time:  String(originalPayload.event_time || ''),
+  };
+  const moodleSig = signInvalidatePayload(moodlePayload);
+
+  // Marcar antes de enviar (para que dos pushes concurrentes del mismo VAT
+  // ambos vean el dedupe y solo uno se envie).
+  moodlePushLastByVat.set(partnerVat, now);
+  moodlePushTimestamps.push(now);
+
+  // Fire-and-forget. Capturamos errores para no afectar al caller.
+  postJson(MOODLE_FINANCIAL_WEBHOOK_URL, { ...moodlePayload, signature: moodleSig }, {
+    'X-Odoo-Signature': moodleSig,
+  }).then((resp) => {
+    const ok = resp && resp.statusCode >= 200 && resp.statusCode < 300;
+    if (!ok) {
+      console.warn(
+        `[MOODLE_PUSH] failed vat=${partnerVat} status=${resp ? resp.statusCode : 'n/a'} body=${(resp && resp.body || '').slice(0, 200)}`,
+      );
+    } else {
+      const moodleData = (resp && resp.json) || {};
+      console.log(
+        `[MOODLE_PUSH] ok vat=${partnerVat} reason=${moodlePayload.reason} ` +
+        `moodle_ok=${moodleData.success !== false} dlq_id=${moodleData.dlq_id || '-'}`,
+      );
+    }
+  }).catch((err) => {
+    console.warn(`[MOODLE_PUSH] exception vat=${partnerVat}: ${err.message}`);
+  });
+
+  return { sent: true };
+}
+
+// Limpieza periodica del Map de dedupe (mantenerlo acotado).
+setInterval(() => {
+  const cutoff = Date.now() - MOODLE_PUSH_DEDUPE_MS * 10;
+  for (const [vat, ts] of moodlePushLastByVat.entries()) {
+    if (ts < cutoff) moodlePushLastByVat.delete(vat);
+  }
+}, 60 * 1000).unref();
 
 // POST /api/odoo/profile/update — actualiza teléfono y/o fecha de nacimiento en Odoo
 app.post('/api/odoo/profile/update', async (req, res) => {
