@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const OdooAPI = require('./odooApi');
 const q10Api  = require('./q10Api');
 const odooStudentsRouter = require('./odoo_students');
@@ -248,17 +250,85 @@ console.log(`[FINANCIAL_SOURCE] Fuente inicial: ${financialSourceConfig.source}`
 
 const app = express();
 
-// Middleware de logging
+// Node termina TLS directamente (no hay nginx delante), asi que req.ip YA es el
+// cliente real. Declararlo explicitamente importa: con trust proxy activado,
+// cualquiera podria saltarse el limitador falsificando X-Forwarded-For.
+app.set('trust proxy', false);
+
+app.use(helmet({
+  // Es una API JSON: la CSP no aporta nada. Pero crossOriginResourcePolicy si:
+  // su valor por defecto ('same-origin') bloquearia las peticiones del LXP, que
+  // vive en otro dominio.
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
+// --- Logging ---
+// El middleware anterior volcaba req.headers completos en CADA peticion, con lo
+// que el x-admin-secret, la X-Api-Key y el wstoken de Moodle acababan en claro
+// en los logs de pm2. Tampoco se registra la query string: ahi viajan las
+// cedulas de los estudiantes.
+let contadorPeticiones = 0;
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  console.log('Headers:', req.headers);
-  console.log('IP:', req.ip);
-  console.log('X-Forwarded-For:', req.headers['x-forwarded-for']);
+  req.id = `r${(++contadorPeticiones).toString(36)}`;
+  const inicio = Date.now();
+  console.log(`[${new Date().toISOString()}] ${req.id} ${req.method} ${req.path} ip=${req.ip}`);
+  res.on('finish', () => {
+    console.log(`${req.id} ${res.statusCode} ${Date.now() - inicio}ms`);
+  });
   next();
 });
 
-app.use(cors());
-app.use(express.json());
+// --- CORS ---
+// Antes era `cors()` sin opciones: Access-Control-Allow-Origin: * en todo,
+// incluidos los endpoints financieros y los de administracion.
+//
+// El caso `!origin` DEBE permitirse: Moodle (cURL) y los webhooks de Odoo no
+// envian Origin, y sin esa excepcion se quedarian fuera. CORS no es el control
+// de acceso de este servicio -de eso se encargan los middlewares de auth-; solo
+// limita que sitios pueden llamarlo desde un navegador.
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (config.corsReportOnly) {
+      // Fase de observacion: se permite y se registra, para construir la lista
+      // con trafico real en vez de de memoria.
+      console.log(`[cors] origen observado: ${origin}`);
+      return cb(null, true);
+    }
+    return cb(null, config.corsAllowedOrigins.includes(origin));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Moodle-Token', 'X-Api-Key',
+                   'X-Admin-Secret', 'X-Odoo-Signature'],
+  credentials: false,
+  maxAge: 600,
+};
+app.use(cors(corsOptions));
+
+// --- Limites de cuerpo ---
+// attach-document recibe un PDF en base64, asi que necesita su propio limite
+// montado ANTES del global.
+app.post('/api/odoo/letters/attach-document', express.json({ limit: '12mb' }));
+app.use(express.json({ limit: '100kb' }));
+
+// --- Limitadores ---
+// Se cuenta sin bloquear (skip) hasta tener el percentil real del trafico: un
+// limite elegido a ojo corta al cron de Moodle un dia de cierre de mes.
+const soloContar = process.env.RATE_LIMIT_ENFORCE !== '1';
+const limitador = (max, ventanaMin, nombre) => rateLimit({
+  windowMs: ventanaMin * 60 * 1000,
+  max,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: () => soloContar,
+  handler: (req, res) => {
+    console.warn(`[ratelimit] ${nombre} agotado para ${req.ip} en ${req.path}`);
+    res.status(429).json({ error: 'too_many_requests' });
+  },
+});
+
+app.use('/api/admin', limitador(10, 15, 'admin'));
 
 // LXP -> Express -> Odoo endpoints (aplazar / retirar / pending-invoices).
 // Auth: optional X-Api-Key (see odoo_students.js). Existing /api/odoo/* routes
@@ -731,7 +801,7 @@ app.post('/api/odoo/letters/invoice', requireService('tramites'), async (req, re
     console.error('[letters/invoice] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -833,7 +903,7 @@ app.post('/api/odoo/letters/attach-document', requireService('tramites'), async 
     console.error('[letters/attach-document] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -909,7 +979,7 @@ app.post('/api/odoo/letters/webhook/payment', async (req, res) => {
     console.error('[letters/webhook/payment] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -999,7 +1069,7 @@ app.post('/api/odoo/revalidations/invoice', requireService('tramites'), async (r
     console.error('[revalidations/invoice] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1046,7 +1116,7 @@ app.post('/api/odoo/revalidations/invoice-status', requireService('tramites'), a
     console.error('[revalidations/invoice-status] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1123,7 +1193,7 @@ app.post('/api/odoo/revalidations/webhook/payment', async (req, res) => {
     console.error('[revalidations/webhook/payment] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1217,7 +1287,7 @@ app.post('/api/odoo/modules/invoice', requireService('tramites'), async (req, re
     console.error('[modules/invoice] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1264,7 +1334,7 @@ app.post('/api/odoo/modules/invoice-status', requireService('tramites'), async (
     console.error('[modules/invoice-status] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1341,7 +1411,7 @@ app.post('/api/odoo/modules/webhook/payment', async (req, res) => {
     console.error('[modules/webhook/payment] Error:', error);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1385,7 +1455,7 @@ app.get('/api/odoo/products/exists', requireService('tramites'), async (req, res
     return res.status(500).json({
       success: false,
       exists: false,
-      error: error.message,
+      error: 'internal_error', request_id: req.id,
     });
   }
 });
@@ -1446,9 +1516,8 @@ app.get('/api/odoo/invoices', async (req, res) => {
 
     console.log(`Se encontraron ${invoices.length} facturas`);
 
-    // --- LOG PARA INSPECCIONAR FACTURAS RECIBIDAS DE ODOO ---
-    console.log('Facturas recibidas de Odoo:', JSON.stringify(invoices, null, 2));
-    // ------------------------------------------------------
+    // No se vuelca el detalle de las facturas al log: es informacion financiera
+    // nominal y acababa entera en los logs de pm2 en cada consulta.
 
     // Mapeamos las facturas para incluir el enlace de pago con el nombre esperado por el frontend
     const invoicesWithPaymentLink = invoices.map(invoice => {
@@ -1493,13 +1562,13 @@ app.get('/api/odoo/invoices', async (req, res) => {
     });
 
     // --- LOG PARA INSPECCIONAR LA RESPUESTA FINAL ANTES DE ENVIAR ---
-    console.log('Respuesta final de facturas con enlaces de pago:', JSON.stringify(invoicesWithPaymentLink, null, 2));
+    console.log(`${req.id} facturas=${invoicesWithPaymentLink.length}`);
     // --------------------------------------------------------------
 
     res.json(invoicesWithPaymentLink);
   } catch (err) {
     console.error('Error en /api/odoo/invoices:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error', request_id: req.id });
   }
 });
 
@@ -1532,7 +1601,7 @@ app.get('/api/odoo/partner-contract-type', async (req, res) => {
 
   } catch (err) {
     console.error('Error en /api/odoo/partner-contract-type:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error', request_id: req.id });
   }
 });
 
@@ -1672,7 +1741,7 @@ app.get('/api/odoo/status', async (req, res) => {
 
   } catch (err) {
     console.error('Error en /api/odoo/status:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error', request_id: req.id });
   }
 });
 
@@ -1846,7 +1915,7 @@ app.post('/api/odoo/status/bulk', requireService('servicio'), async (req, res) =
 
   } catch (err) {
     console.error('Error en /api/odoo/status/bulk:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'internal_error', request_id: req.id });
   }
 });
 
@@ -2048,7 +2117,7 @@ app.post('/api/odoo/profile/update', async (req, res) => {
 
   } catch (error) {
     console.error('[Profile Update] Error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: 'internal_error', request_id: req.id });
   }
 });
 
@@ -2283,7 +2352,7 @@ app.get('/api/lxp/calendar', async (req, res) => {
     return res.json(moodleRes);
   } catch (err) {
     console.error('[LXP_CALENDAR] Error contacting Moodle WS:', err.message);
-    return res.status(502).json({ status: -1, message: err.message });
+    return res.status(502).json({ status: -1, error: 'upstream_error', request_id: req.id });
   }
 });
 
@@ -2346,7 +2415,7 @@ app.get('/api/odoo/students/career-funnel', async (req, res) => {
     res.json({ odoo_count, odoo_active, career_name: odooCareerName });
   } catch (err) {
     console.error('[CAREER_FUNNEL] Error consultando Odoo:', err.message);
-    res.status(500).json({ error: 'Error consultando datos de Odoo', detail: err.message });
+    res.status(500).json({ error: 'Error consultando datos de Odoo', request_id: req.id });
   }
 });
 
@@ -2354,10 +2423,54 @@ const PORT = process.env.PORT || 4000;
 const HOST = '0.0.0.0';
 
 // Configuración de HTTPS
-const httpsOptions = {
-  key: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/privkey.pem'),
-  cert: fs.readFileSync('/home/ubuntu/odoo-proxy/certs/fullchain.pem')
-};
+// --- Manejo de errores ---
+// Se devolvia `err.message` crudo al cliente en una docena de sitios. El mensaje
+// de xmlrpc arrastra el nombre de la base de datos, la consulta y a veces la URL
+// con credenciales. Ahora el detalle va al log con un identificador y al cliente
+// solo le llega ese identificador.
+app.use((err, req, res, next) => {
+  const id = req.id || 'sin-id';
+  console.error(`[err ${id}] ${req.method} ${req.path}`, err && err.stack ? err.stack : err);
+  if (res.headersSent) return next(err);
+  res.status(err && err.status ? err.status : 500).json({
+    error: 'internal_error',
+    request_id: id,
+  });
+});
+
+// Una promesa rechazada sin capturar tumba el proceso en Node >= 15, y este
+// servicio lleva 626 caidas registradas por, entre otras cosas, respuestas HTTP
+// de error que el deserializador XML-RPC no sabe interpretar. Se registra y se
+// sigue: el proceso degradado sirve mejor que el proceso muerto.
+let rechazosNoCapturados = 0;
+process.on('unhandledRejection', (razon) => {
+  rechazosNoCapturados += 1;
+  console.error(`[unhandledRejection #${rechazosNoCapturados}]`, razon);
+});
+
+// Una excepcion no capturada si deja el proceso en estado dudoso: se cierra
+// ordenadamente y pm2 lo levanta limpio.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException] cerrando para que pm2 reinicie limpio:', err);
+  process.exit(1);
+});
+
+// Rutas desde configuracion en vez de absolutas en el codigo. Si faltan, el
+// mensaje dice cual es el fichero que falta, en vez de un ENOENT desnudo.
+let httpsOptions;
+try {
+  httpsOptions = {
+    key: fs.readFileSync(config.tlsKeyPath),
+    cert: fs.readFileSync(config.tlsCertPath),
+  };
+} catch (e) {
+  console.error(`[boot] No se pudieron leer los certificados TLS:
+` +
+    `  TLS_KEY_PATH=${config.tlsKeyPath}
+  TLS_CERT_PATH=${config.tlsCertPath}
+  ${e.message}`);
+  process.exit(1);
+}
 
 // Inicialización y refresco periódico del valor de mora desde Moodle
 refreshOverdueGraceFromMoodle().catch(() => {});
