@@ -1,2 +1,19 @@
+# Secretos y entorno
+.env
+.env.*
+!.env.example
+
+# Dependencias
+node_modules/
+
+# Certificados TLS
 certs/
+
+# Estado mutable en disco (no es configuracion: lo escribe el proceso en runtime)
+bypass_config.json
+financial_source_config.json
+
+# Logs y respaldos sueltos
+*.log
 renew.log
+*.bk
