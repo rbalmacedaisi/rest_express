@@ -3,6 +3,7 @@ const cors = require('cors');
 const OdooAPI = require('./odooApi');
 const q10Api  = require('./q10Api');
 const odooStudentsRouter = require('./odoo_students');
+const { requireService, requireAdmin, getMetrics } = require('./auth');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -674,7 +675,7 @@ async function readModuleInvoiceById(odoo, invoiceId) {
   return invoices && invoices.length ? invoices[0] : null;
 }
 
-app.post('/api/odoo/letters/invoice', async (req, res) => {
+app.post('/api/odoo/letters/invoice', requireService('tramites'), async (req, res) => {
   try {
     const externalRequestId = String(req.body?.external_request_id || '').trim();
     const documentNumber = String(req.body?.document_number || '').trim();
@@ -762,7 +763,7 @@ app.post('/api/odoo/letters/invoice', async (req, res) => {
   }
 });
 
-app.post('/api/odoo/letters/attach-document', async (req, res) => {
+app.post('/api/odoo/letters/attach-document', requireService('tramites'), async (req, res) => {
   try {
     const externalRequestId = String(req.body?.external_request_id || '').trim();
     const documentNumber = String(req.body?.document_number || '').trim();
@@ -941,7 +942,7 @@ app.post('/api/odoo/letters/webhook/payment', async (req, res) => {
 });
 
 // Crea (o recupera) la factura de reválida en Odoo a partir de un registro de Moodle.
-app.post('/api/odoo/revalidations/invoice', async (req, res) => {
+app.post('/api/odoo/revalidations/invoice', requireService('tramites'), async (req, res) => {
   try {
     const externalRequestId = String(req.body?.external_request_id || '').trim();
     const documentNumber = String(req.body?.document_number || '').trim();
@@ -1031,7 +1032,7 @@ app.post('/api/odoo/revalidations/invoice', async (req, res) => {
 });
 
 // Verificación on-demand del estado de pago de una factura de reválida.
-app.post('/api/odoo/revalidations/invoice-status', async (req, res) => {
+app.post('/api/odoo/revalidations/invoice-status', requireService('tramites'), async (req, res) => {
   try {
     const invoiceId = String(req.body?.invoice_id || '').trim();
     const externalRequestId = String(req.body?.external_request_id || '').trim();
@@ -1159,7 +1160,7 @@ app.post('/api/odoo/revalidations/webhook/payment', async (req, res) => {
 // ============================================================
 
 // Crea la factura Odoo para una solicitud de módulo. Idempotente por external_request_id.
-app.post('/api/odoo/modules/invoice', async (req, res) => {
+app.post('/api/odoo/modules/invoice', requireService('tramites'), async (req, res) => {
   try {
     const externalRequestId = String(req.body?.external_request_id || '').trim();
     const documentNumber    = String(req.body?.document_number    || '').trim();
@@ -1249,7 +1250,7 @@ app.post('/api/odoo/modules/invoice', async (req, res) => {
 });
 
 // Verificación on-demand del estado de pago de una factura de módulo.
-app.post('/api/odoo/modules/invoice-status', async (req, res) => {
+app.post('/api/odoo/modules/invoice-status', requireService('tramites'), async (req, res) => {
   try {
     const invoiceId        = String(req.body?.invoice_id || '').trim();
     const externalRequestId = String(req.body?.external_request_id || '').trim();
@@ -1374,7 +1375,7 @@ app.post('/api/odoo/modules/webhook/payment', async (req, res) => {
 
 // Verifica si un product.product existe en Odoo. Usado por Moodle para
 // validar antes de crear una factura (evita errores XML-RPC feos al usuario).
-app.get('/api/odoo/products/exists', async (req, res) => {
+app.get('/api/odoo/products/exists', requireService('tramites'), async (req, res) => {
   try {
     const productId = parseInt(req.query.product_id, 10);
     if (!Number.isFinite(productId) || productId <= 0) {
@@ -1703,7 +1704,7 @@ app.get('/api/odoo/status', async (req, res) => {
 });
 
 // NUEVO ENDPOINT: Verificar Estado de Estudiantes en Bloque (Bulk)
-app.post('/api/odoo/status/bulk', async (req, res) => {
+app.post('/api/odoo/status/bulk', requireService('servicio'), async (req, res) => {
   try {
     const { documentNumbers } = req.body;
 
@@ -2078,16 +2079,29 @@ app.post('/api/odoo/profile/update', async (req, res) => {
   }
 });
 
+// --- OBSERVABILIDAD ---
+// /api/health es publico a proposito: lo consulta el monitor externo.
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    env: ODOO_ENV,
+    uptime_s: Math.round(process.uptime()),
+    node: process.version,
+  });
+});
+
+// Contadores de autenticacion. Son los que deciden cuando es seguro cerrar cada
+// grupo: mientras 'auth.missing' o 'auth.invalid' no sean cero para un grupo,
+// cerrarlo dejaria fuera a un consumidor legitimo.
+app.get('/api/metrics', requireAdmin, (req, res) => {
+  res.json({ auth: getMetrics(), uptime_s: Math.round(process.uptime()) });
+});
+
 // --- ENDPOINTS ADMIN: BYPASS FINANCIERO ---
 
-// Middleware de autenticación para endpoints admin
-function adminAuth(req, res, next) {
-  const secret = req.headers['x-admin-secret'];
-  if (!secret || secret !== ADMIN_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  next();
-}
+// La autenticacion admin vive ahora en auth.js (requireAdmin): compara en
+// tiempo constante en vez de con !==, y lleva contador.
+const adminAuth = requireAdmin;
 
 // GET /api/admin/bypass - Consultar estado actual del bypass
 app.get('/api/admin/bypass', adminAuth, (req, res) => {
