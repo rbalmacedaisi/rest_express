@@ -12,10 +12,13 @@
 const https = require('https');
 const http = require('http');
 
-const Q10_BASE  = process.env.Q10_BASE      || 'https://site2.q10.com';
-const Q10_USER  = process.env.Q10_USER      || 'q10@isi.edu.pa';
-const Q10_PASS  = process.env.Q10_PASS      || 'taswi4-penhEp-fecmij';
-const Q10_APLENT = process.env.Q10_APLENT_ID || '5f0cac06-a506-459a-a7b8-364b50574728';
+// Credenciales desde config.js: ya no hay usuario ni contrasena en el codigo.
+const config = require('./config');
+
+const Q10_BASE = config.q10Base;
+const Q10_USER = config.q10User;
+const Q10_PASS = config.q10Pass;
+const Q10_APLENT = config.q10AplentId;
 
 const RELOGIN_INTERVAL_MS = 270 * 1000; // Re-login before the 300s Q10 session expires
 const REQ_DELAY_MS        = 250;        // Delay between requests to avoid throttling

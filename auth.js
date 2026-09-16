@@ -20,11 +20,12 @@
  */
 
 const crypto = require('crypto');
+const config = require('./config');
 
-const API_KEY = process.env.ODOO_PROXY_API_KEY || '';
+const API_KEY = config.proxyApiKey;
 // Permite rotar la clave sin ventana: durante la rotacion valen las dos.
 const API_KEY_PREVIOUS = process.env.ODOO_PROXY_API_KEY_PREVIOUS || '';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'gmk_admin_bypass_2026';
+const ADMIN_SECRET = config.adminSecret;
 
 const ENFORCE = new Set(
   (process.env.AUTH_ENFORCE || '')

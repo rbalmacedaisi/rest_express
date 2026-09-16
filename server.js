@@ -9,54 +9,27 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// --- ENTORNO (DES-LXP-008) ---
-// Identificador del entorno de despliegue. Valores esperados:
-// production | staging | development. Default production para
-// preservar comportamiento si no se setea (back-compat).
-//
-// Validación de consistencia: si ODOO_ENV=staging pero ODOO_URL apunta
-// a prod (odoo.isi.edu.pa) o ODOO_DB=odoo, falla en boot. Esta es la
-// red de seguridad para que un deploy staging jamás termine hablando
-// con prod por error de configuración.
-const ODOO_ENV = (process.env.ODOO_ENV || 'production').toLowerCase();
-const ALLOWED_ODOO_ENVS = new Set(['production', 'staging', 'development']);
+// --- CONFIGURACION ---
+// Todo process.env se lee en config.js, que valida y aborta el arranque si falta
+// algo obligatorio o si el par entorno/destino no cuadra. Ver la nota sobre el
+// orden de despliegue en ese archivo: pm2 no relee el entorno al reiniciar.
+const config = require('./config');
 
-if (!ALLOWED_ODOO_ENVS.has(ODOO_ENV)) {
-  throw new Error(
-    `[boot] ODOO_ENV inválido: ${ODOO_ENV}. Esperado: production | staging | development.`
-  );
-}
-
-const BOOT_ODOO_URL = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
-const BOOT_ODOO_DB = process.env.ODOO_DB || 'odoo_staging';
-
-if (ODOO_ENV === 'staging') {
-  const prodSignals = [
-    BOOT_ODOO_URL.includes('odoo.isi.edu.pa') && !BOOT_ODOO_URL.includes('staging'),
-    BOOT_ODOO_DB === 'odoo' || BOOT_ODOO_DB === 'odoo_prod',
-  ];
-  if (prodSignals.some(Boolean)) {
-    throw new Error(
-      `[boot] ODOO_ENV=staging pero la config apunta a prod ` +
-      `(ODOO_URL=${BOOT_ODOO_URL}, ODOO_DB=${BOOT_ODOO_DB}). ` +
-      `Revisa .env antes de continuar.`
-    );
-  }
-}
-
-console.log(`[boot] ODOO_ENV=${ODOO_ENV} ODOO_URL=${BOOT_ODOO_URL} ODOO_DB=${BOOT_ODOO_DB} MOODLE_URL=${process.env.MOODLE_URL || 'https://lms.isi.edu.pa'}`);
+const ODOO_ENV = config.odooEnv;
+const BOOT_ODOO_URL = config.odooUrl;
+const BOOT_ODOO_DB = config.odooDb;
 
 // --- BYPASS FINANCIERO GLOBAL ---
 // Secret para proteger el endpoint admin (cámbialo en producción)
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'gmk_admin_bypass_2026';
+const ADMIN_SECRET = config.adminSecret;
 
 // --- PERIODO DE GRACIA (primer login) ---
-const MOODLE_URL         = process.env.MOODLE_URL         || 'https://lms.isi.edu.pa';
-const MOODLE_GRACE_TOKEN = process.env.MOODLE_GRACE_TOKEN || 'gmk_grace_check_2026';
+const MOODLE_URL         = config.moodleUrl;
+const MOODLE_GRACE_TOKEN = config.moodleGraceToken;
 const MOODLE_LETTERS_WEBHOOK_URL = process.env.MOODLE_LETTERS_WEBHOOK_URL || `${MOODLE_URL}/local/grupomakro_core/letters_webhook.php`;
-const MOODLE_LETTERS_WEBHOOK_TOKEN = process.env.MOODLE_LETTERS_WEBHOOK_TOKEN || 'gmk_letter_webhook_2026';
-const ODOO_LETTERS_WEBHOOK_SECRET = process.env.ODOO_LETTERS_WEBHOOK_SECRET || 'gmk_letters_hmac_2026';
-const ODOO_BASE_URL = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
+const MOODLE_LETTERS_WEBHOOK_TOKEN = config.moodleLettersWebhookToken;
+const ODOO_LETTERS_WEBHOOK_SECRET = config.odooLettersWebhookSecret;
+const ODOO_BASE_URL = config.odooUrl;
 
 // --- MORA / RESTRICCIÓN DE ACCESO AL LXP ---
 // Días de gracia tras el vencimiento antes de restringir el acceso. Por
@@ -158,7 +131,7 @@ const MOODLE_MODULE_WEBHOOK_TOKEN = process.env.MOODLE_MODULE_WEBHOOK_TOKEN || M
 const ODOO_MODULE_WEBHOOK_SECRET = process.env.ODOO_MODULE_WEBHOOK_SECRET || ODOO_REVALID_WEBHOOK_SECRET;
 
 // --- INVALIDACIÓN DE CACHÉ POR PAGO (módulo moodle_invoice_payment_webhook) ---
-const ODOO_PAYMENT_WEBHOOK_SECRET = process.env.ODOO_PAYMENT_WEBHOOK_SECRET || 'gmk_payment_invalidate_2026';
+const ODOO_PAYMENT_WEBHOOK_SECRET = config.odooPaymentWebhookSecret;
 
 // --- PUSH A MOODLE PARA REFRESCAR gmk_financial_status ---
 // Después de invalidar el caché de Express, también empujamos el cambio a
@@ -1480,7 +1453,7 @@ app.get('/api/odoo/invoices', async (req, res) => {
     // Mapeamos las facturas para incluir el enlace de pago con el nombre esperado por el frontend
     const invoicesWithPaymentLink = invoices.map(invoice => {
       let paymentLink = invoice.access_url;
-      const odooBaseUrl = process.env.ODOO_URL || 'https://odoo.isi.edu.pa';
+      const odooBaseUrl = config.odooUrl;
 
       try {
         let urlObj;

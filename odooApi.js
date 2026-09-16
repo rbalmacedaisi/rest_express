@@ -2,11 +2,16 @@
 const xmlrpc = require('xmlrpc');
 const { URL } = require('url'); // Importa la clase URL
 
-// Usa variables de entorno o valores por defecto
-const ODOO_URL_BASE = process.env.ODOO_URL || 'https://odoo.isi.edu.pa'; // Guarda la URL base
-const ODOO_DB = process.env.ODOO_DB || 'odoo_staging';
-const ODOO_USER = process.env.ODOO_USER || 'tic@isi.edu.pa';
-const ODOO_APIKEY = process.env.ODOO_APIKEY || '3b2a6fa21d721f678eaf8551ac04a280099e97a7';
+// La configuracion viene de config.js, que es el unico modulo que lee
+// process.env. Antes este archivo lo leia por su cuenta con sus propios valores
+// por defecto, y podia acabar hablando con una base de datos distinta de la que
+// server.js creia haber validado. La API key ya no tiene valor por defecto.
+const config = require('./config');
+
+const ODOO_URL_BASE = config.odooUrl;
+const ODOO_DB = config.odooDb;
+const ODOO_USER = config.odooUser;
+const ODOO_APIKEY = config.odooApiKey;
 
 class OdooAPI {
     constructor() {
