@@ -21,6 +21,7 @@
 
 const crypto = require('crypto');
 const config = require('./config');
+const identity = require('./moodle_identity');
 
 const API_KEY = config.proxyApiKey;
 // Permite rotar la clave sin ventana: durante la rotacion valen las dos.
@@ -42,8 +43,12 @@ function enforcing(grupo) {
 const metrics = {
   'auth.ok.service': 0,
   'auth.ok.admin': 0,
+  'auth.ok.token': 0,
   'auth.missing': 0,
   'auth.invalid': 0,
+  'auth.mismatch': 0,
+  'auth.degraded': 0,
+  'auth.unavailable': 0,
   'auth.permissive_pass': 0,
 };
 
@@ -123,6 +128,100 @@ function requireService(grupo) {
   };
 }
 
+
+/**
+ * Exige un wstoken de Moodle valido y, cuando la ruta habla de una cedula,
+ * que esa cedula sea la del titular del token.
+ *
+ * Es el cierre del agujero principal del proxy: `?documentNumber=<cedula>`
+ * devolvia el estado de cuenta completo de cualquiera, sin credencial alguna.
+ *
+ * El parametro `documentNumber` se sigue aceptando a proposito durante la
+ * transicion: el LXP se despliega aparte y una pestana abierta seguira
+ * enviandolo durante horas. Se compara contra el derivado del token en vez de
+ * usarse. Se compara por igualdad exacta tras trim, sin normalizar de mas:
+ * el valor que manda el LXP sale del mismo campo de Moodle que ya casa con el
+ * `vat` de Odoo, asi que cualquier normalizacion inventada solo puede crear
+ * falsos rechazos y colisiones.
+ */
+function requireStudent(grupo) {
+  return async function (req, res, next) {
+    const cerrado = enforcing(grupo);
+    const token = identity.extraerToken(req);
+
+    const permitirOFallar = (estado, codigo, cuerpo) => {
+      res.setHeader('X-Auth-Status', estado);
+      if (!cerrado) {
+        contar('auth.permissive_pass');
+        console.warn(`[auth] PERMISIVO ${req.method} ${req.path} (${estado}).`);
+        return next();
+      }
+      return res.status(codigo).json(cuerpo);
+    };
+
+    if (!token) {
+      contar('auth.missing');
+      return permitirOFallar('missing', 401, {
+        error: 'unauthorized',
+        message: 'Falta el token de Moodle (cabecera Authorization: Bearer).',
+      });
+    }
+
+    let identidad;
+    let degradada = false;
+    try {
+      const r = await identity.resolver(token);
+      identidad = r.identidad;
+      degradada = r.degradada;
+    } catch (e) {
+      if (e instanceof identity.ErrorTokenInvalido) {
+        contar('auth.invalid');
+        // 401 solo aqui: Moodle ha dicho que el token no vale. Es lo unico que
+        // debe provocar un cierre de sesion en el cliente.
+        return permitirOFallar('invalid', 401, {
+          error: 'invalid_token',
+          message: 'El token de Moodle no es valido.',
+        });
+      }
+      // No se pudo hablar con Moodle. NUNCA 401: un 401 aqui desconectaria a
+      // todos los estudiantes a la vez cada vez que Moodle tosa.
+      contar('auth.unavailable');
+      res.setHeader('Retry-After', '30');
+      return permitirOFallar('unavailable', 503, {
+        error: 'auth_backend_unavailable',
+        message: 'No se pudo verificar la identidad. Reintente en unos segundos.',
+      });
+    }
+
+    if (degradada) {
+      contar('auth.degraded');
+      res.setHeader('X-Auth-Degraded', 'stale-cache');
+    }
+
+    // Si la ruta trae una cedula, tiene que ser la suya.
+    const pedida = String(req.query.documentNumber || req.body?.documentNumber || '').trim();
+    const propia = String(identidad.documentNumber || '').trim();
+    if (pedida && propia && pedida !== propia) {
+      contar('auth.mismatch');
+      // Cedulas hasheadas: no se vuelca la de otra persona al log por un intento
+      // de acceso indebido.
+      console.warn(`[auth] MISMATCH userid=${identidad.userid} ` +
+        `pedida=${identity._hash(pedida).slice(0, 8)} propia=${identity._hash(propia).slice(0, 8)}`);
+      return permitirOFallar('mismatch', 403, {
+        error: 'document_mismatch',
+        message: 'El documento solicitado no corresponde al usuario autenticado.',
+      });
+    }
+
+    contar('auth.ok.token');
+    res.setHeader('X-Auth-Status', degradada ? 'ok-degraded' : 'ok');
+    req.student = identidad;
+    // A partir de aqui la cedula la manda el token, no el cliente.
+    if (propia) req.query.documentNumber = propia;
+    return next();
+  };
+}
+
 /**
  * Exige X-Admin-Secret. Sustituye a la comparacion con !== del adminAuth
  * anterior, que ademas se medía contra un valor por defecto publicado en el
@@ -146,11 +245,13 @@ function getMetrics() {
     enforce: Array.from(ENFORCE),
     service_key_configured: !!API_KEY,
     rotation_key_configured: !!API_KEY_PREVIOUS,
+    ...identity.getMetricas(),
   };
 }
 
 module.exports = {
   requireService,
+  requireStudent,
   requireAdmin,
   getMetrics,
   secretosIguales,

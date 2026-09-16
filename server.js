@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const OdooAPI = require('./odooApi');
 const q10Api  = require('./q10Api');
 const odooStudentsRouter = require('./odoo_students');
-const { requireService, requireAdmin, getMetrics } = require('./auth');
+const { requireService, requireStudent, requireAdmin, getMetrics } = require('./auth');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -1460,7 +1460,7 @@ app.get('/api/odoo/products/exists', requireService('tramites'), async (req, res
   }
 });
 
-app.get('/api/odoo/invoices', async (req, res) => {
+app.get('/api/odoo/invoices', requireStudent('estudiante'), async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
     const partnerId = req.query.partnerId;
@@ -1572,7 +1572,7 @@ app.get('/api/odoo/invoices', async (req, res) => {
   }
 });
 
-app.get('/api/odoo/partner-contract-type', async (req, res) => {
+app.get('/api/odoo/partner-contract-type', requireStudent('estudiante'), async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
 
@@ -1606,7 +1606,7 @@ app.get('/api/odoo/partner-contract-type', async (req, res) => {
 });
 
 // NUEVO ENDPOINT: Verificar Estado del Estudiante (Con Caché)
-app.get('/api/odoo/status', async (req, res) => {
+app.get('/api/odoo/status', requireStudent('estudiante'), async (req, res) => {
   try {
     const documentNumber = req.query.documentNumber;
 
@@ -1921,7 +1921,7 @@ app.post('/api/odoo/status/bulk', requireService('servicio'), async (req, res) =
 
 
 // NUEVO ENDPOINT: Limpiar Caché
-app.post('/api/odoo/cache/clear', (req, res) => {
+app.post('/api/odoo/cache/clear', requireStudent('estudiante'), (req, res) => {
   const documentNumber = req.body.documentNumber;
 
   if (documentNumber) {
@@ -2064,7 +2064,7 @@ setInterval(() => {
 }, 60 * 1000).unref();
 
 // POST /api/odoo/profile/update — actualiza teléfono y/o fecha de nacimiento en Odoo
-app.post('/api/odoo/profile/update', async (req, res) => {
+app.post('/api/odoo/profile/update', requireStudent('estudiante'), async (req, res) => {
   const { documentNumber, phone, birthdate } = req.body;
 
   if (!documentNumber) {
@@ -2304,7 +2304,7 @@ function httpsPostJson(urlString, paramsObj, timeoutMs = 20000) {
   });
 }
 
-app.get('/api/lxp/calendar', async (req, res) => {
+app.get('/api/lxp/calendar', requireStudent('estudiante'), async (req, res) => {
   const userToken = req.query.wstoken || req.headers['x-moodle-token'];
   const userId = parseInt(req.query.userId || '0', 10) || 0;
   const initDate = typeof req.query.initDate === 'string' ? req.query.initDate : '';
