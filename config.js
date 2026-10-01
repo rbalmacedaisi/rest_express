@@ -26,6 +26,59 @@
 
 const faltantes = [];
 
+/**
+ * Minimal .env loader for the production secrets.
+ *
+ * We deliberately avoid pulling in `dotenv` so the dependency surface
+ * stays small (this runs in the EC2 odoo-proxy container with npm
+ * install --omit=dev). Rules:
+ *
+ *   - Reads `./.env` from process.cwd() if present.
+ *   - Each non-comment, non-blank line is KEY=VALUE.
+ *   - Values may be wrapped in single OR double quotes; both kinds of
+ *     inner quotes are stripped.
+ *   - Empty values, leading/trailing whitespace are tolerated.
+ *   - Lines already set in process.env are NOT overridden, so a shell
+ *     export beats .env (which matches Unix convention).
+ *   - Variable expansion / interpolation is NOT supported; if you need
+ *     ${OTHER}, just put the literal value.
+ *   - The file must be readable only by the process user (root or
+ *     ubuntu); chmod 600. The .env.example is the public template, the
+ *     .env is the live one and lives in /home/ubuntu/odoo-proxy/.env.
+ *
+ * If the file is missing, the loader silently no-ops and the normal
+ * fail-fast in this module runs against process.env.
+ */
+function loadDotEnv() {
+    const fs = require('fs');
+    const path = require('path');
+    const filepath = path.join(process.cwd(), '.env');
+    let raw;
+    try {
+        raw = fs.readFileSync(filepath, 'utf8');
+    } catch (_) {
+        // .env absent or unreadable: fall through to process.env only.
+        return;
+    }
+    const lines = raw.split(/\r?\n/);
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq <= 0) continue;
+        const key = trimmed.slice(0, eq).trim();
+        let value = trimmed.slice(eq + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+        }
+        if (process.env[key] === undefined) {
+            process.env[key] = value;
+        }
+    }
+}
+loadDotEnv();
+
 function requerido(nombre) {
   const valor = process.env[nombre];
   if (valor === undefined || valor === '') {
