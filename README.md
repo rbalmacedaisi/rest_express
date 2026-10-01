@@ -115,3 +115,70 @@ curl -X POST http://<staging-express-internal-dns>:3000/api/odoo/cache/invalidat
 | `504 Q10 query failed` | `financial_source_config.json` quedó en `q10` de un test previo | `POST /api/odoo/admin/financial-source {source:"odoo"}` |
 | `BYPASS activado por error` | Alguien activó bypass y no desactivó | `POST /api/odoo/admin/bypass {enabled:false}` |
 | Boot log dice `ODOO_ENV=production` | SSM parameter no se inyectó al `userdata` | Verificar permisos IAM del rol EC2 + reiniciar |
+
+## RET-01 (Solicitud de Retiro del Programa)
+
+El WDR manager de Moodle (`local_grupomakro_core`) usa estos endpoints
+para cerrar el ciclo "el estudiante queda en estado retirado" pasando por
+Odoo. Auth: `X-Api-Key` con el mismo valor que `ODOO_PROXY_API_KEY`
+(el módulo lee `config.proxyApiKey`).
+
+### GET /api/odoo/wdr/pending-balance?documentNumber=<vat>
+
+Devuelve el balance pendiente (posted + not_paid|partial) de un partner,
+sin mutar nada. El inbox admin de Moodle lo llama al hacer clic en
+"Procesar" para decidir si bloquea o fuerza la cancelación.
+
+Respuesta (200):
+
+```json
+{
+  "success": true,
+  "documentNumber": "8-123-456",
+  "partner_id": 17,
+  "partner_name": "Juan Pérez",
+  "financial_status": "vencido",
+  "hasBalance": true,
+  "total": 1234.56,
+  "currency": "USD",
+  "currencies": ["USD"],
+  "invoiceCount": 2,
+  "overdueCount": 2,
+  "fetchedAt": "2026-10-01T10:00:00.000Z"
+}
+```
+
+### POST /api/odoo/wdr/process-retirement
+
+Body:
+
+```json
+{
+  "documentNumber": "8-123-456",
+  "wdrId": 42,
+  "reason": "Retiro por motivos economicos, autorizado por Direccion Academica.",
+  "force": false,
+  "actor_username": "admin",
+  "actor_email": "admin@isi.edu.pa",
+  "actor_moodle_id": 5
+}
+```
+
+- Si `hasBalance=true` y `force=false` → responde **409** con
+  `error: 'pending_balance'`, `balance: { total, currency, invoiceCount, overdueCount }`.
+- Si pasa, invoca `wizard.aplazar.estudiante.do_retiro(vat, reason, actor)`
+  (mismo código path que `POST /api/odoo/students/retirar`) y devuelve
+  `{ success, action: 'retiro', wdrId, partner_id, partner_name, hasBalance, forced,
+     balance, invoices_updated, subscriptions_updated, moodle_updated, processed_at }`.
+
+Validación: `wdrId > 0`, `reason.length >= 10` (tope del resto de endpoints
+de `students/*`).
+
+Notas:
+- `force=true` requiere que el llamador ya validó la justificación en Moodle
+  (cap `manage_wdr_requests` + audit log) — Express solo aplica el mínimo
+  (`reason.length >= 10`) para no duplicar reglas.
+- El `wdrId` es informativo: el audit definitivo vive en
+  `mdl_gmk_wdr.status`, `forced_at/by/reason` en Moodle, no en Odoo.
+- Si el partner tiene varias monedas en su `account.move`, `currency` viene
+  como `"USD|PAB"` y `currencies` mantiene los tokens separados.

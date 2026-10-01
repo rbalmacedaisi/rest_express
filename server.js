@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit');
 const OdooAPI = require('./odooApi');
 const q10Api  = require('./q10Api');
 const odooStudentsRouter = require('./odoo_students');
+const wdrRouter = require('./wdr');
 const { requireService, requireStudent, requireAdmin, getMetrics } = require('./auth');
 const https = require('https');
 const fs = require('fs');
@@ -334,6 +335,14 @@ app.use('/api/admin', limitador(10, 15, 'admin'));
 // Auth: optional X-Api-Key (see odoo_students.js). Existing /api/odoo/* routes
 // below are intentionally left untouched.
 app.use('/api/odoo', odooStudentsRouter);
+
+// RET-01 (Solicitud de Retiro del Programa) -> Express -> Odoo endpoints.
+// Mounted on /api/odoo so Moodle's WDR manager can hit
+//   GET  /api/odoo/wdr/pending-balance
+//   POST /api/odoo/wdr/process-retirement
+// without changing the public URL scheme. Auth: same X-Api-Key scope as
+// /api/odoo/students/* (see wdr.js).
+app.use('/api/odoo/wdr', wdrRouter);
 
 // --- CACHE IMPLEMENTATION (asimétrica) ---
 // Razones que significan "puede acceder". Se cachean por 24h porque un cambio
