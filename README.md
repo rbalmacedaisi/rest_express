@@ -182,3 +182,10 @@ Notas:
   `mdl_gmk_wdr.status`, `forced_at/by/reason` en Moodle, no en Odoo.
 - Si el partner tiene varias monedas en su `account.move`, `currency` viene
   como `"USD|PAB"` y `currencies` mantiene los tokens separados.
+## Despliegue (Hostinger)
+
+Express corre en el VPS de Moodle (lms.isi.edu.pa) con pm2 (`odoo-proxy`).
+Un push a `main` se despliega solo: `/usr/local/sbin/isi-autodeploy.sh`
+revisa GitHub cada 2 minutos, hace fast-forward, corre `npm ci` si cambian
+las dependencias y `pm2 reload odoo-proxy`. Si `/api/health` no responde,
+vuelve al commit anterior. Registro: `/var/log/isi-autodeploy.log`.
