@@ -2130,6 +2130,91 @@ app.post('/api/odoo/profile/update', requireStudent('estudiante'), async (req, r
   }
 });
 
+// POST /api/odoo/profile/sync-from-moodle — perfil del estudiante editado en Moodle
+// (user/editadvanced.php) -> Odoo. Mismo mapeo que moodle_user_sync usa para cargar
+// a Moodle, en sentido inverso. Moodle solo envia los campos que cambiaron.
+// Body: { moodleUserId, previousDocumentNumber, actor, fields: { name, email, birthdate,
+//   documentType, documentTypeName, documentNumber, phone, studentStatus, journey, enrollmentPeriod } }
+const PROFILE_SYNC_DOC_TYPES = ['CC', 'CE', 'PP', 'CD'];
+const PROFILE_SYNC_STATUSES = ['activo', 'aplazado', 'retirado', 'suspendido', 'desertor', 'graduado', 'egresado'];
+app.post('/api/odoo/profile/sync-from-moodle', requireService('tramites'), async (req, res) => {
+  const { moodleUserId, previousDocumentNumber, actor } = req.body || {};
+  const f = (req.body && req.body.fields) || {};
+  if (!moodleUserId && !previousDocumentNumber) {
+    return res.status(400).json({ success: false, error: 'moodleUserId o previousDocumentNumber requerido' });
+  }
+  const str = (v) => (v === undefined || v === null ? undefined : String(v).trim());
+  const partnerData = {};
+  const muData = {};
+  if (str(f.name)) { partnerData.name = str(f.name); muData.name = str(f.name); }
+  if (str(f.email)) { partnerData.email = str(f.email); muData.email = str(f.email); }
+  if (str(f.birthdate)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(str(f.birthdate))) return res.status(400).json({ success: false, error: 'birthdate invalida' });
+    partnerData.birthdate = str(f.birthdate); muData.birthDate = str(f.birthdate);
+  }
+  if (str(f.documentType)) {
+    if (!PROFILE_SYNC_DOC_TYPES.includes(str(f.documentType))) return res.status(400).json({ success: false, error: 'documentType invalido' });
+    partnerData.x_studio_tipo_de_documento = str(f.documentType);
+    if (str(f.documentTypeName)) muData.documentType = str(f.documentTypeName);
+  }
+  if (str(f.documentNumber)) { partnerData.vat = str(f.documentNumber); muData.documentNumber = str(f.documentNumber); }
+  if (str(f.phone) !== undefined && f.phone !== undefined) { partnerData.phone = str(f.phone); muData.phone = str(f.phone); }
+  if (str(f.studentStatus)) {
+    if (!PROFILE_SYNC_STATUSES.includes(str(f.studentStatus))) return res.status(400).json({ success: false, error: 'studentStatus invalido' });
+    partnerData.x_studio_student_status = str(f.studentStatus); muData.studentstatus = str(f.studentStatus);
+  }
+  if (str(f.journey)) { partnerData.x_studio_jornada = str(f.journey); muData.gmkjourney = str(f.journey); }
+  if (str(f.enrollmentPeriod)) { partnerData.x_studio_periodo_de_matricula = str(f.enrollmentPeriod); muData.enrollment_period = str(f.enrollmentPeriod); }
+  if (Object.keys(partnerData).length === 0) {
+    return res.status(400).json({ success: false, error: 'sin campos para actualizar' });
+  }
+
+  try {
+    const odoo = new OdooAPI();
+    await odoo.authenticate();
+
+    // 1) Por el id de Moodle (moodle.user.moodle_user_id); 2) por la cedula anterior.
+    let partnerId = null;
+    let muId = null;
+    if (moodleUserId) {
+      const mus = await odoo.call('moodle.user', 'search_read',
+        [[['moodle_user_id', '=', String(moodleUserId)]]], { fields: ['id', 'partner_id'], limit: 1 });
+      if (mus && mus.length) { muId = mus[0].id; partnerId = mus[0].partner_id && mus[0].partner_id[0]; }
+    }
+    if (!partnerId && previousDocumentNumber) {
+      const ps = await odoo.call('res.partner', 'search_read',
+        [[['vat', '=', String(previousDocumentNumber).trim()]]], { fields: ['id'], limit: 1 });
+      if (ps && ps.length) partnerId = ps[0].id;
+    }
+    if (!partnerId) {
+      return res.status(404).json({ success: false, error: 'partner_not_found' });
+    }
+    if (!muId) {
+      const mus = await odoo.call('moodle.user', 'search_read',
+        [[['partner_id', '=', partnerId]]], { fields: ['id'], limit: 1 });
+      if (mus && mus.length) muId = mus[0].id;
+    }
+
+    if (req.body && req.body.dryRun) {
+      const cur = await odoo.call('res.partner', 'read', [[partnerId], Object.keys(partnerData)]);
+      return res.json({ success: true, dryRun: true, partnerId, moodleUserRecordId: muId, current: cur && cur[0], partnerData, muData });
+    }
+    await odoo.call('res.partner', 'write', [[partnerId], partnerData]);
+    if (muId && Object.keys(muData).length) {
+      await odoo.call('moodle.user', 'write', [[muId], muData]);
+    }
+    console.log(`[Profile Sync Moodle->Odoo] moodleUser=${moodleUserId} actor=${actor} partner=${partnerId} moodle.user=${muId || '-'} campos=${Object.keys(partnerData).join(',')}`);
+    res.json({ success: true, partnerId, moodleUserRecordId: muId, written: Object.keys(partnerData) });
+  } catch (error) {
+    console.error('[Profile Sync Moodle->Odoo] Error:', error.message);
+    // Validaciones de Odoo (p. ej. cedula duplicada): no tiene sentido reintentar.
+    if (/ValidationError|UserError|AccessError/i.test(String(error.message || ''))) {
+      return res.status(422).json({ success: false, error: 'odoo_rejected', detail: String(error.message).slice(0, 300) });
+    }
+    res.status(500).json({ success: false, error: 'internal_error', request_id: req.id });
+  }
+});
+
 // --- OBSERVABILIDAD ---
 // /api/health es publico a proposito: lo consulta el monitor externo.
 app.get('/api/health', (req, res) => {
