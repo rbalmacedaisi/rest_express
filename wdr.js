@@ -165,6 +165,13 @@ router.get('/pending-balance', async (req, res) => {
             currencies,
             invoiceCount: rows.length,
             overdueCount,
+            // Detalle para que Bienestar le diga al estudiante que debe y desde cuando.
+            invoices: rows.map((inv) => ({
+                name: inv.name,
+                due: inv.invoice_date_due || null,
+                residual: Math.round(Number(inv.amount_residual || 0) * 100) / 100,
+                overdue: !!(inv.invoice_date_due && inv.invoice_date_due < today),
+            })),
             fetchedAt: new Date().toISOString(),
         });
     } catch (err) {
